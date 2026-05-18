@@ -1,0 +1,51 @@
+<?xml version='1.0' encoding='utf-8'?>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">
+  <graph edgedefault="undirected">
+    <node id="C1" />
+    <node id="C2" />
+    <node id="C3" />
+    <node id="D1" />
+    <node id="D2" />
+    <node id="D3" />
+    <node id="D4" />
+    <node id="D5" />
+    <node id="A1" />
+    <node id="A2" />
+    <node id="A3" />
+    <node id="A4" />
+    <node id="A5" />
+	<node id="ipnode-1" />
+	<node id="ipnode-2" />
+    <node id="ipnode-3" />
+	<node id="ipnode-4" />
+    <node id="ipnode-5" />
+    <edge source="C1" target="C2" />
+    <edge source="C1" target="C3" />
+    <edge source="C1" target="D1" />
+    <edge source="C1" target="D2" />
+    <edge source="C1" target="D3" />
+    <edge source="C2" target="C3" />
+    <edge source="C2" target="D3" />
+    <edge source="C2" target="D4" />
+    <edge source="C2" target="D5" />
+    <edge source="C3" target="D1" />
+    <edge source="C3" target="D2" />
+    <edge source="C3" target="D4" />
+    <edge source="C3" target="D5" />
+    <edge source="D1" target="A1" />
+    <edge source="D1" target="A2" />
+    <edge source="D2" target="A1" />
+    <edge source="D2" target="A3" />
+    <edge source="D3" target="A2" />
+    <edge source="D3" target="A4" />
+    <edge source="D4" target="A3" />
+    <edge source="D4" target="A5" />
+    <edge source="D5" target="A4" />
+    <edge source="D5" target="A5" />
+    <edge source="A1" target="ipnode-1" />
+    <edge source="A2" target="ipnode-2" />
+	<edge source="A3" target="ipnode-3" />
+	<edge source="A4" target="ipnode-4" />
+    <edge source="A5" target="ipnode-5" />
+  </graph>
+</graphml>
