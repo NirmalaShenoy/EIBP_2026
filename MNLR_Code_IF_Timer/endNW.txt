@@ -1,0 +1,1033 @@
+#include "endNetworkUtils.h"
+
+extern int enableLogScreen;
+
+struct addr_tuple *failedLL_head=NULL;
+struct addr_list *headaddr=NULL;
+struct addr_tuple *tablehead=NULL;
+
+struct iprequestFlag{
+	char ip[20];
+	int flag;
+	struct iprequestFlag *next;
+}*head_iRF;
+
+void clearEntryState() {
+	struct addr_tuple *current;
+	for (current = tablehead; current != NULL; current = current->next) {
+		current->isNew = false;
+	}
+}
+
+char * allocate_strmem(int len) {
+	void *tmp;
+
+	if (len <= 0) {
+		fprintf(stderr,
+				"ERROR: Cannot allocate memory because len = %i in allocate_strmem().\n",
+				len);
+		exit(EXIT_FAILURE);
+	}
+
+	tmp = (char *) malloc(len * sizeof(char));
+	if (tmp != NULL) {
+		memset(tmp, 0, len * sizeof(char));
+		return (tmp);
+	} else {
+		fprintf(stderr,
+				"ERROR: Cannot allocate memory for array allocate_strmem().\n");
+		exit(EXIT_FAILURE);
+	}
+}
+
+uint8_t * allocate_ustrmem(int len) {
+	void *tmp;
+
+	if (len <= 0) {
+		fprintf(stderr,
+				"ERROR: Cannot allocate memory because len = %i in allocate_ustrmem().\n",
+				len);
+		exit(EXIT_FAILURE);
+	}
+
+	tmp = (uint8_t *) malloc(len * sizeof(uint8_t));
+	if (tmp != NULL) {
+		memset(tmp, '\0', len * sizeof(uint8_t));
+		return (tmp);
+	} else {
+		fprintf(stderr,
+				"ERROR: Cannot allocate memory for array allocate_ustrmem().\n");
+		exit(EXIT_FAILURE);
+	}
+}
+
+int * allocate_intmem(int len) {
+	void *tmp;
+
+	if (len <= 0) {
+		fprintf(stderr,
+				"ERROR: Cannot allocate memory because len = %i in allocate_intmem().\n",
+				len);
+		exit(EXIT_FAILURE);
+	}
+
+	tmp = (int *) malloc(len * sizeof(int));
+	if (tmp != NULL) {
+		memset(tmp, 0, len * sizeof(int));
+		return (tmp);
+	} else {
+		fprintf(stderr,
+				"ERROR: Cannot allocate memory for array allocate_intmem().\n");
+		exit(EXIT_FAILURE);
+	}
+}
+
+void add_entry_LL(struct addr_tuple *node) {
+	if (tablehead == NULL) {
+		tablehead = node;
+		tablehead->next = NULL;
+	} else {
+		struct addr_tuple *current = tablehead;
+		while (current->next != NULL) {
+			current = current->next;
+		}
+		current->next = node;
+		node->next = NULL;
+	}
+}
+
+struct addr_tuple* add_matched_entry(struct addr_tuple *node,
+		struct addr_tuple *matched) {
+	struct addr_tuple *ptr = matched;
+	struct addr_tuple *temp = NULL;
+
+	temp = (struct addr_tuple*) calloc(1, sizeof(struct addr_tuple));
+	memcpy(temp, node, sizeof(struct addr_tuple));
+	temp->next = NULL;
+
+	if (ptr == NULL) {
+		matched = temp;
+	} else {
+		while (ptr->next != NULL) {
+			ptr = ptr->next;
+		}
+		ptr->next = temp;
+	}
+	return matched;
+}
+
+// delete entries in the table.
+bool delete_entry_LL_IP(struct in_addr ip) {
+        bool hasDeletions = false;
+
+        if (tablehead == NULL) {
+                return false;
+        } else {
+                struct addr_tuple *current = tablehead;
+                struct addr_tuple *prev = NULL;
+                while (current != NULL) {
+					if (ip.s_addr == current->ip_addr.s_addr) {
+						hasDeletions = true;
+						//printf("Removing %s \n", inet_ntoa(current->ip_addr));
+						if (tablehead == current) {
+							tablehead = tablehead->next;
+							free(current);
+							current = tablehead;
+							continue;
+						} else {
+							prev->next = current->next;
+							free(current);
+							current = prev;
+						}
+					}
+					prev = current;
+					current= current->next;
+                }
+        }
+        //printf("hasDeletiongsd%d\n", hasDeletions);
+        print_entries_LL();
+        return hasDeletions;
+}
+
+bool delete_entry_LL_Addr(uint8_t* tier_addr,char recvOnEtherPort[5]){
+	bool hasDeletions = false;
+	//printf("\n In DeleteEntryLL");
+        if (tablehead == NULL) {
+				//printf("tablehead is NULL");
+                return false;
+        } else {
+				//printf("\n In DeleteEntryLL - else - 172");
+                struct addr_tuple *current = tablehead;
+                struct addr_tuple *prev = NULL;
+                while (current != NULL) {
+					//printf("\n In DeleteEntryLL - while - 176");
+					
+					if (strcmp(tier_addr,current->tier_addr)==0) {
+					
+						hasDeletions = true;
+						//publish IPLabel map delete to my children - to do - samruddhi 4/11/2022
+						printf("\nRemoving %s \n", current->tier_addr);
+						publishIPLabelMap(current->tier_addr,1,recvOnEtherPort);
+						if (tablehead == current) {
+							tablehead = tablehead->next;
+							free(current);
+							current = tablehead;
+							continue;
+						} else {
+							prev->next = current->next;
+							free(current);
+							current = prev;
+						}
+					}
+					else{
+						//printf("\nIn Else-  193");
+					}
+					
+					prev = current;
+					current= current->next;
+                }
+        }
+		//printf("\n%d",hasDeletions);
+        return hasDeletions;
+}
+
+bool delete_entry_LL_Addr_updated(char* failedAddrs[], int failedCount, char recvOnEtherPort[5], int myTier, char*** deletedLabelsOut, int* deletedCountOut) {
+    if (failedCount <= 0 || tablehead == NULL) {
+        *deletedLabelsOut = NULL;
+        *deletedCountOut = 0;
+        return false;
+    }
+
+    bool hasDeletions = false;
+    char** deletedLabels = calloc(failedCount, sizeof(char*));
+    if (deletedLabels == NULL) {
+        perror("Failed to allocate memory for deleted labels");
+        *deletedLabelsOut = NULL;
+        *deletedCountOut = 0;
+        return false;
+    }
+
+    int deletedCount = 0;
+
+    // Process each failed address
+    for (int i = 0; i < failedCount; i++) {
+        char* tierAddr = failedAddrs[i];
+        struct addr_tuple* current = tablehead;
+        struct addr_tuple* prev = NULL;
+
+        while (current != NULL) {
+            if (strcmp(tierAddr, current->tier_addr) == 0) {
+                hasDeletions = true;
+                printf("\nRemoving Label: %s From Ip to Label Map\n", current->tier_addr);
+
+                if (deletedCount < failedCount) {
+                    deletedLabels[deletedCount] = strdup(current->tier_addr);  // Ensure safe copy
+                    if (deletedLabels[deletedCount] == NULL) {
+                        perror("Failed to duplicate label");
+                    } else {
+                        deletedCount++;
+                    }
+                }
+
+                // Remove the current node
+                if (tablehead == current) {
+                    tablehead = current->next;
+                    free(current);
+                    current = tablehead;  // Move to next node
+                } else {
+                    prev->next = current->next;
+                    free(current);
+                    current = prev ? prev->next : NULL;  // Ensure valid pointer
+                }
+
+                break;  // Move to the next address in the buffer
+            } else {
+                prev = current;
+                current = current->next;
+            }
+        }
+    }
+
+    // Send all deleted labels to publishIPLabelMap_updated at once
+    if (deletedCount > 0 && myTier != 3) {
+        int match_Port = matchPort(recvOnEtherPort);
+        if (match_Port != 1) {
+            publishIPLabelMap_updated(deletedLabels, deletedCount, 1, recvOnEtherPort, false);
+        }
+    }
+
+    // Pass the deleted labels and count back to the caller
+    *deletedLabelsOut = deletedLabels;
+    *deletedCountOut = deletedCount;
+
+    return hasDeletions;
+}
+
+
+
+
+
+/***/
+void delete_failed_LL_Addr(uint8_t* tier_addr){
+
+        if (failedLL_head == NULL) {
+				printf("failedLL_head is NULL");
+                //return false;
+        } else {
+                struct addr_tuple *current = failedLL_head;
+                struct addr_tuple *prev = failedLL_head;
+                while (current != NULL) {
+					
+                        if (strcmp(tier_addr,current->tier_addr)==0) {
+							
+                                if (failedLL_head == current) {
+                                        failedLL_head = failedLL_head->next;
+                                        free(current);
+                                        current = failedLL_head;
+                                        continue;
+                                } else {
+                                        prev->next = current->next;
+                                        free(current);
+                                        current = prev;
+                                }
+                        }
+                        prev = current;
+                        current= current->next;
+                }
+        }
+}
+// match the longest prefix
+/*  */
+
+void add_failed_entry_LL(struct addr_tuple *node) { 
+	
+	if (failedLL_head == NULL) {
+		failedLL_head = node;
+		failedLL_head->next = NULL;
+	} else {
+		struct addr_tuple *current = failedLL_head;
+		while (current->next != NULL) {
+			current = current->next;
+		}
+		current->next = node;
+		node->next = NULL;
+	}
+}
+/** 
+void add_failed_entry_LL(struct addr_tuple** nodes, int count) {
+    if (count <= 0) {
+        return;
+    }
+
+    if (failedLL_head == NULL) {
+        // Initialize the failed list with the first node
+        failedLL_head = nodes[0];
+        struct addr_tuple* current = failedLL_head;
+
+        // Link all other nodes in the list
+        for (int i = 1; i < count; i++) {
+            current->next = nodes[i];
+            current = current->next;
+        }
+        current->next = NULL;
+    } else {
+        // Traverse to the end of the current failed list
+        struct addr_tuple* current = failedLL_head;
+        while (current->next != NULL) {
+            current = current->next;
+        }
+
+        // Link all new nodes at the end of the list
+        for (int i = 0; i < count; i++) {
+            current->next = nodes[i];
+            current = current->next;
+        }
+        current->next = NULL;
+    }
+}
+*/
+void add_failed_entry_LL_updated(struct addr_tuple* failedEntries[], int failedCount) {
+    if (failedCount <= 0) {
+        return;
+    }
+
+    struct addr_tuple* newHead = NULL; // Head of the new nodes
+    struct addr_tuple* newTail = NULL; // Tail of the new nodes
+
+    // Add failed entries to the new list
+    for (int i = 0; i < failedCount; i++) {
+        struct addr_tuple* newNode = (struct addr_tuple*)calloc(1, sizeof(struct addr_tuple));
+        if (newNode == NULL) {
+            perror("Failed to allocate memory for addr_tuple");
+            return;
+        }
+
+        // Initialize the node
+        strcpy(newNode->tier_addr, failedEntries[i]->tier_addr);
+        newNode->if_index = -1;
+        newNode->isNew = true;
+        newNode->next = NULL;
+		//printf("Adding failed entry %d: %s\n", i + 1, newNode->tier_addr);
+        // Append to the new list
+        if (newHead == NULL) {
+            newHead = newNode;
+            newTail = newNode;
+        } else {
+            newTail->next = newNode;
+            newTail = newNode;
+        }
+    }
+
+    // Merge the new list with the existing failed list
+    if (failedLL_head == NULL) {
+        failedLL_head = newHead;
+    } else {
+        struct addr_tuple* current = failedLL_head;
+        while (current->next != NULL) {
+            current = current->next;
+        }
+        current->next = newHead;
+    }
+}
+
+/**********************************************************
+struct addr_tuple {
+	int if_index;
+	bool isNew;
+	char tier_addr[MAX_TIER_ADDR_SIZE];
+	struct in_addr ip_addr;
+	uint8_t cidr;
+	char etherPortName[10];
+	struct addr_tuple *next;
+};
+this function takes ip addresses and tier addresses corresponding to an edge node
+It tries to locate  an IP address mapped to Tieraddres in
+struct tablehead 
+
+******************************************************************/
+struct addr_tuple *find_entry_LL(struct in_addr *ip, char *tierAddr) {
+	if (tablehead == NULL) {
+		printf("\n tablehead == NULL");
+		return NULL;
+	} else {
+		struct addr_tuple *current = tablehead;
+		while (current != NULL) {
+			struct in_addr temp;
+			memcpy(&temp, ip, sizeof(struct in_addr));
+
+			temp.s_addr = ntohl(temp.s_addr);
+			temp.s_addr = ((temp.s_addr >> (32 - current->cidr))
+					<< (32 - current->cidr));
+			temp.s_addr = htonl(temp.s_addr);
+
+			if ((current->ip_addr.s_addr == temp.s_addr)
+					&& (strncmp(tierAddr, current->tier_addr, strlen(tierAddr))
+							== 0)) {
+				return current;
+			}
+			current = current->next;
+		}
+		return NULL;
+	}
+}
+
+/********************************************************************
+print_entries_LL
+
+Prints the ip to label map
+
+***********************************************************************/
+void print_entries_LL() {
+	struct addr_tuple *current= tablehead;
+	printf("\n\n********************%s**********************", __FUNCTION__);
+	printf("\nPrinting Tier Address to IP Adress mapping");
+	if(current != NULL){
+		if(enableLogScreen)
+			printf("\nTier Address\t\tIP Address\n");
+		for (current = tablehead; current != NULL; current = current->next) {
+			if(enableLogScreen)
+				printf("%s\t\t\t%s/%u\n", current->tier_addr, inet_ntoa(current->ip_addr), current->cidr);
+
+		}
+	}
+}
+
+/****************************************************************************
+	findIPforLabel
+	This function takes the label as the input and finds the IP address tagged to the given label 
+***********************************************************************/
+void findIPforLabel(char label[],char ip[]){
+	struct addr_tuple *current;
+	for (current = tablehead; current != NULL; current = current->next) {
+		if (strcmp(current->tier_addr,label)==0) {
+			strcpy(ip,inet_ntoa(current->ip_addr));
+			printf("\nipAddr: %s", inet_ntoa(current->ip_addr));
+		}
+	}
+}
+
+/**********************************************************
+	searchIPinMyMap
+	This function takes the ip as the input.
+	Returns 0 if the IP is not in my IP to label map
+	Returns 1 if the IP is found in the IP to label map 
+*************************************************************/
+int searchIPinMyMap(char ip[]){
+	struct addr_tuple *current;
+	//printf("\nSearching: %s",ip);
+	char temp_ip[20],temp_ip2[20];
+	strcpy(temp_ip,ip);
+	//printf("\nSearching: %s",temp_ip);
+	for (current = tablehead; current != NULL; current = current->next) {
+		strcpy(temp_ip2,inet_ntoa(current->ip_addr));
+		//printf("\nwith: %s",temp_ip2);
+		if (strcmp(temp_ip,temp_ip2)==0) {
+			//printf("\nipAddr found: %s,%s", temp_ip,temp_ip2);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+//for request - 2/4/2022
+// int buildIPResolvePacket(uint8_t *data, struct in_addr ip){
+// 	// int entries = 1; // 1 is kept by default since we will send only one address to resolve at a time.
+// 	data[0] = (uint8_t) MESSAGE_TYPE_REQUEST_IP_RESOLVE;
+// 	// data[1] = entries;
+// 	// data[2] = MESSAGE_TYPE_ENDNW_ADD;
+// 	int payloadLen = 1;
+// 	uint8_t ipLen = (uint8_t) sizeof(struct in_addr);
+// 	data[payloadLen] = ipLen;
+// 	payloadLen++;
+// 	memcpy(&data[payloadLen], &ip, ipLen);
+// 	payloadLen = payloadLen + ipLen;
+// 	return payloadLen;
+// }
+
+int buildIPPublishPacket(uint8_t *data, char addr[]){
+	// int entries = 1; // 1 is kept by default since we will send only one address to resolve at a time.
+	printf("\nIn buildIPPublishPacket \n");
+		int entries=0;
+		// data[2] = MESSAGE_TYPE_ENDNW_ADD;
+		int payloadLen = 2;
+
+		//struct addr_list *current;
+		for (struct addr_tuple *current = tablehead; current != NULL; current = current->next) {
+
+			if(strcmp(addr,current->tier_addr)==0){
+				printf("Got a new label \n");
+				uint8_t tierLen = (uint8_t) strlen(current->tier_addr); //Adding publish label 
+
+				data[payloadLen] = tierLen; // tier len 
+				payloadLen++;
+				memcpy(&data[payloadLen], current->tier_addr, tierLen); 
+				printf("\ntier_addr : %s",current->tier_addr);//tier-addr
+				payloadLen = payloadLen + tierLen; 
+				
+				uint8_t ipLen = (uint8_t) sizeof(struct in_addr); //Adding publish IP
+				data[payloadLen] = ipLen;
+				payloadLen++;
+				memcpy(&data[payloadLen], &current->ip_addr, ipLen);
+				payloadLen = payloadLen + ipLen;
+				printf("\nipAddr: %s", inet_ntoa(current->ip_addr));
+				
+				data[payloadLen] = current->cidr; //Adding cidr
+				payloadLen++;
+				entries++;
+			}
+		}
+		if (entries > 0) {
+			//printf("entries > 0\n");
+			data[0] = (uint8_t) MESSAGE_TYPE_PUBLISH_IP_ADD;
+			data[1] = entries;
+		} else {
+			payloadLen = 0;
+		}
+		//printf("payloadLen: %d\n",payloadLen);
+	return payloadLen;
+
+}
+
+//for response - 2/4/2022
+int buildIPResolvePacket(uint8_t *data, char destTier[],int tierValue){
+	// int entries = 1; // 1 is kept by default since we will send only one address to resolve at a time.
+	printf("\nIn buildIPResolvePacket \n");
+	if(tierValue==1){
+		int entries=0;
+		// data[2] = MESSAGE_TYPE_ENDNW_ADD;
+		int payloadLen = 2;
+				
+		uint8_t destTierLen = (uint8_t) strlen(destTier); //Adding Destination 
+		data[payloadLen] = destTierLen; // tier len 
+		payloadLen++;
+		
+		memcpy(&data[payloadLen], destTier, destTierLen); 
+		printf("Dest_tier_addr added: %s\n",destTier);//tier-addr
+		payloadLen = payloadLen + destTierLen; 
+
+		for (struct addr_list *current = headaddr; current != NULL; current = current->next) {
+			printf("Got my label in addr tuple \n");
+				
+			uint8_t tierLen = (uint8_t) strlen(current->label); //Adding response label 
+
+			data[payloadLen] = tierLen; // tier len 
+			payloadLen++;
+			memcpy(&data[payloadLen], current->label, tierLen); 
+			printf("\ntier_addr : %s",current->label);//tier-addr
+			payloadLen = payloadLen + tierLen; 
+			
+			uint8_t ipLen = (uint8_t) sizeof(struct in_addr); //Adding response IP
+			data[payloadLen] = ipLen;
+			payloadLen++;
+			memcpy(&data[payloadLen], &current->ip_addr, ipLen);
+			payloadLen = payloadLen + ipLen;
+			printf("\nipAddr: %s", inet_ntoa(current->ip_addr));
+			
+			data[payloadLen] = current->cidr; //Adding cidr
+			payloadLen++;
+			entries++;
+		}
+		if (entries > 0) {
+			data[0] = (uint8_t) MESSAGE_TYPE_RESPONSE_IP_RESOLVE;
+			data[1] = entries;
+		} else {
+			payloadLen = 0;
+		}
+	return payloadLen;
+	}
+}
+
+/**************************************************************
+ * 
+ * 
+ */
+int buildPayload(uint8_t *data, int msgLen, int checkIndex) {
+	struct addr_tuple *current;
+
+	int payloadLen = 3;
+	int entries = 0;
+	//print_entries_LL();
+	if (msgLen == 2) {
+		for (current = tablehead; current != NULL; current = current->next) {
+			if (current->isNew == true && checkIndex != current->if_index) {
+				//printf("\nONLY_NEW\n");
+				uint8_t tierLen = (uint8_t) strlen(current->tier_addr);
+				data[payloadLen] = tierLen; // tier len 
+				payloadLen++;
+
+				memcpy(&data[payloadLen], current->tier_addr, tierLen); 
+				payloadLen = payloadLen + tierLen; 
+
+				uint8_t ipLen = (uint8_t) sizeof(struct in_addr);
+				data[payloadLen] = ipLen;
+				payloadLen++;
+
+				memcpy(&data[payloadLen], &current->ip_addr, ipLen); 
+				//printf("\nip_addr : %s",current->ip_addr);//cuurent->ipaddr
+				payloadLen = payloadLen + ipLen;
+
+				data[payloadLen] = current->cidr; //
+				payloadLen++;
+				entries++; //entries
+				//print_entries_LL();
+			}
+		}
+	} else {
+		
+		for (current = tablehead; current != NULL; current = current->next) {
+			uint8_t tierLen = (uint8_t) strlen(current->tier_addr);
+			data[payloadLen] = tierLen;
+			payloadLen++;
+
+			memcpy(&data[payloadLen], current->tier_addr, tierLen);
+			payloadLen = payloadLen + tierLen;
+
+			uint8_t ipLen = (uint8_t) sizeof(struct in_addr);
+			data[payloadLen] = ipLen;
+			payloadLen++;
+
+			memcpy(&data[payloadLen], &current->ip_addr, ipLen);
+			payloadLen = payloadLen + ipLen;
+
+			data[payloadLen] = current->cidr;
+			payloadLen++;
+			entries++;
+		}
+	}
+
+	if (entries > 0) {
+
+		data[0] = (uint8_t) MESSAGE_TYPE_ENDNW;
+		data[1] = entries;
+		data[2] = MESSAGE_TYPE_ENDNW_ADD;
+	} else {
+		payloadLen = 0;
+	}
+	return payloadLen;
+}
+/*
+
+*/
+int buildPayloadRemoveAdvts(uint8_t *data, struct addr_tuple *failedIPS, int msg) {
+        struct addr_tuple *current;
+        int payloadLen = 3;    // To reserve byte for keeping track of the entries and message_type  
+        int entries = 0;                
+                                   
+        for (current=failedIPS; (current != NULL) && (current->isNew == true) ; current = current->next) {
+			//printf("\npopulating : %d ",current->isNew);
+                uint8_t tierLen = (uint8_t)strlen(current->tier_addr);
+                data[payloadLen] = tierLen;
+                payloadLen++;           
+                                                
+                memcpy(&data[payloadLen], current->tier_addr, tierLen);
+                payloadLen = payloadLen + tierLen;      
+                                                
+                uint8_t ipLen = (uint8_t)sizeof(struct in_addr);
+                data[payloadLen] = ipLen;
+                payloadLen++;           
+                                        
+                memcpy(&data[payloadLen], &current->ip_addr, ipLen );
+                payloadLen = payloadLen + ipLen;
+                        
+                data[payloadLen] = current->cidr;
+
+                current->isNew = false;
+                payloadLen++;
+                entries++;
+				
+			delete_failed_LL_Addr(current->tier_addr);
+        }
+        // fill number of entries added to payload, do this only if entries exist.
+        if (entries > 0) {
+                // Message type 5, used for advertising TierAdd<->Ipaddress entries.
+                data[0] = (uint8_t) MESSAGE_TYPE_ENDNW;
+                data[1] = entries;
+                data[2] = msg;
+		} else  {
+                payloadLen = 0;
+        }
+        return payloadLen;
+}
+
+/* function to update the last 4 bytes*/
+
+char* updateEndTierAddr(char destinationInterfaceIPAddr[],char Mytier[]) {
+	
+	printf("Destination IP address is : %s\n", destinationInterfaceIPAddr);
+	int found =0;
+	struct in_addr ip;
+	if (inet_pton(AF_INET, destinationInterfaceIPAddr, &ip) == -1) { //inet_pton - convert IPv4 and IPv6 addresses from text to binary form
+		if(enableLogScreen)
+			printf("Error: inet_pton() returned error");
+	}
+
+	struct addr_tuple *current = tablehead;
+	while (current != NULL) {
+		struct in_addr temp;
+		memcpy(&temp, &ip, sizeof(struct in_addr));
+		temp.s_addr = ntohl(temp.s_addr);//s_addr = /* address in network byte order */
+
+		temp.s_addr = (temp.s_addr >> (32 - current->cidr))
+				<< (32 - current->cidr);
+
+		temp.s_addr = htonl(temp.s_addr); //The htonl() function converts the unsigned integer hostlong from host byte order to network byte order.
+		if (temp.s_addr == current->ip_addr.s_addr) {
+
+			printf("Found destination tier label :  %s \n", current->tier_addr);
+			found = 1;
+			//Called this function in msg12 to avoid calling it when I have the label --02/11/2022
+			//responseIPresolve(current->tier_addr,current->ip_addr);
+			//Creating a list of addresses
+				struct addr_list*temp2;
+				temp2 = (struct addr_list *) malloc(sizeof(struct addr_list));
+				strcpy(temp2->label, current->tier_addr);
+				memcpy(&temp2->ip_addr,&current->ip_addr, sizeof(struct in_addr));
+				temp2->cidr= current->cidr;
+			
+				if(enableLogScreen)
+					//printf("\nLabel : %s\n",temp2->label);
+					// printf("\ncidr : %d\n",temp2->cidr);
+					// printf("\nipAddr: %s\n", inet_ntoa(temp2->ip_addr));
+				
+				if (headaddr == NULL) { //linked list of portTag
+					headaddr = temp2;
+					headaddr->next = NULL;
+				} else {
+					temp2->next = headaddr;
+					headaddr = temp2;
+				}
+		}
+		current = current->next;
+	}
+	if(found==1){
+		//printf("\nPrinting...");
+		printAddresstoResponse();
+		printf("\n");
+		return headaddr->label;
+	}
+
+	if(found==0){
+		//add request call 1/31/2022
+		printf("\nTier address corresponding to IP address Not Found \n");
+		//----------------------request flag find---------------------
+		int requestsent = 0;
+		struct iprequestFlag *current;
+		for (current = head_iRF; current != NULL; current = current->next) {
+			if (strcmp(current->ip,destinationInterfaceIPAddr)==0) {
+				requestsent = 1;
+				printf("Request will not be sent as its already in-progress");
+			}
+		}
+		if(requestsent==0){
+		//add flag before sending request : 3/25/2022
+		//----------------------request flag add start---------------------
+		struct iprequestFlag*temp2;
+		temp2 = (struct iprequestFlag *) malloc(sizeof(struct iprequestFlag));
+		strcpy(temp2->ip, destinationInterfaceIPAddr);
+		temp2->flag= 1;
+			
+		if(enableLogScreen)
+			printf("\nip : %s\n",temp2->ip);
+			// printf("\ncidr : %d\n",temp2->cidr);
+			// printf("\nipAddr: %s\n", inet_ntoa(temp2->ip_addr));
+			//linked list of portTag
+		if (head_iRF == NULL) {
+			head_iRF = temp2;
+			head_iRF->next = NULL;
+		} else {
+			temp2->next = head_iRF;
+			head_iRF = temp2;
+		}
+		//----------------------request flag add end---------------------
+		requestIPresolve(destinationInterfaceIPAddr,Mytier);
+		}
+	}
+
+	return NULL;
+}
+
+
+/*   */
+void getListofResponseAddr(char destinationInterfaceIPAddr[]) {
+	
+	printf("\nDestination IP address is : %s", destinationInterfaceIPAddr);
+	int found =0;
+	struct in_addr ip;
+	if (inet_pton(AF_INET, destinationInterfaceIPAddr, &ip) == -1) { //inet_pton - convert IPv4 and IPv6 addresses from text to binary form
+		if(enableLogScreen)
+			printf("Error: inet_pton() returned error");
+
+	}
+
+	struct addr_tuple *current = tablehead;
+	while (current != NULL) {
+		struct in_addr temp;
+		memcpy(&temp, &ip, sizeof(struct in_addr));
+		temp.s_addr = ntohl(temp.s_addr);//s_addr = /* address in network byte order */
+
+		temp.s_addr = (temp.s_addr >> (32 - current->cidr))
+				<< (32 - current->cidr);
+
+		temp.s_addr = htonl(temp.s_addr); //The htonl() function converts the unsigned integer hostlong from host byte order to network byte order.
+		if (temp.s_addr == current->ip_addr.s_addr) {
+
+			printf("\nupdateEndTierAddr Found tier :  %s \n", current->tier_addr);
+			found = 1;
+			//Called this function in msg12 to avoid calling it when I have the label --02/11/2022
+			//responseIPresolve(current->tier_addr,current->ip_addr);
+			//Creating a list of addresses
+				struct addr_list*temp2;
+				temp2 = (struct addr_list *) malloc(sizeof(struct addr_list));
+				strcpy(temp2->label, current->tier_addr);
+				struct addr_list *t;
+				if(enableLogScreen)
+					printf("\nLabel : %s",temp2->label);
+
+				//linked list of portTag
+				if (headaddr == NULL) {
+					headaddr = temp2;
+					headaddr->next = NULL;
+				} else {
+
+					temp2->next = headaddr;
+					headaddr = temp2;
+					// t = (struct addr_list *) headaddr;
+					// while (t->next != NULL)
+					// 	t = t->next;
+					// t->next = temp2;
+					// t = temp2;
+						// t->next = NULL;
+				}
+		}
+		current = current->next;
+	}
+	if(found==1){
+		printf("\nPrinting... \n");
+		printAddresstoResponse();
+		printf("\n");
+	}
+
+	if(found==0){
+		printf("\nTier List Found \n");
+	}
+}
+
+/*  */
+struct in_addr* getNetworkIP(char destinationInterfaceIPAddr[]) {
+
+	struct in_addr ip;
+	if (inet_pton(AF_INET, destinationInterfaceIPAddr, &ip) == -1) {
+		if(enableLogScreen)
+			printf("Error: inet_pton() returned error");
+	}
+	struct addr_tuple *current = tablehead;
+	while (current != NULL) {
+		struct in_addr temp;
+		memcpy(&temp, &ip, sizeof(struct in_addr));
+
+		temp.s_addr = ntohl(temp.s_addr);
+
+		temp.s_addr = (temp.s_addr >> (32 - current->cidr))
+				<< (32 - current->cidr);
+
+		temp.s_addr = htonl(temp.s_addr);
+		if (temp.s_addr == current->ip_addr.s_addr) {
+			return &current->ip_addr;
+		}
+		current = current->next;
+	}
+	return NULL;
+}
+
+/* */
+char* findPortName(struct in_addr *nwIP) {
+
+	struct addr_tuple *current = tablehead;
+	while (nwIP != NULL && current != NULL) {
+		if (current->ip_addr.s_addr == nwIP->s_addr) {
+			
+			return current->etherPortName;
+		}
+
+		current = current->next;
+	}
+	return NULL;
+}
+//Deletes the label from the Label List(LL) and adds the label to the failedLL_head
+/*   */
+
+void modify_LL(char *addr,char recvOnEtherPort[5]){
+	if (tablehead == NULL) {
+                //return false;
+        } else {
+                struct addr_tuple *current = tablehead;
+                //struct addr_tuple *prev = NULL;
+                while (current != NULL) {
+                        if(strcmp(current->tier_addr, addr)==0) {
+                                //hasDeletions = true;
+                                //struct addr_tuple *temp = (struct addr_tuple*) calloc (1, sizeof(struct addr_tuple));
+								
+								struct addr_tuple *a = (struct addr_tuple*) calloc (1, sizeof(struct addr_tuple));
+                        		strcpy(a->tier_addr, current->tier_addr);
+                        // insert info about index from which the packet has been received from.
+                        		a->if_index = -1;
+                        		a->isNew = true;
+                        		memcpy(&a->ip_addr, &current->ip_addr, sizeof(struct in_addr));
+                        		a->cidr = current->cidr;
+								strcpy(a->etherPortName, current->etherPortName);
+
+								add_failed_entry_LL(a);
+								delete_entry_LL_Addr(a->tier_addr,recvOnEtherPort);
+                                
+                        }
+						
+                        current= current->next;
+                }
+        }
+}
+
+void modify_LL_updated(char labels[][128], int totalEntries, char recvOnEtherPort[5], int myTier) {
+	
+    if (tablehead == NULL) {
+        // No entries to process
+        return;
+    }
+
+    // Temporary storage for failed entries
+    struct addr_tuple** failedEntries = malloc(totalEntries * sizeof(struct addr_tuple*));
+    if (failedEntries == NULL) {
+        perror("Failed to allocate memory for failed entries");
+        return;
+    }
+    int failedCount = 0;
+
+    // Process the labels
+    for (int i = 0; i < totalEntries; i++) {
+        char* label = labels[i];
+
+        struct addr_tuple* current = tablehead;
+        while (current != NULL) {
+            if (strcmp(current->tier_addr, label) == 0) {
+                // Create a new entry for the failed list
+                struct addr_tuple* a = (struct addr_tuple*)calloc(1, sizeof(struct addr_tuple));
+                if (a == NULL) {
+                    perror("Failed to allocate memory for addr_tuple");
+					for (int j = 0; j < failedCount; j++) {
+                        free(failedEntries[j]);
+                    }
+                    free(failedEntries);
+                    return;
+                }
+
+                // Copy details from the current entry
+                strcpy(a->tier_addr, current->tier_addr);
+                a->if_index = -1;
+                a->isNew = true;
+                memcpy(&a->ip_addr, &current->ip_addr, sizeof(struct in_addr));
+                a->cidr = current->cidr;
+                strcpy(a->etherPortName, current->etherPortName);
+
+                // Store in the failed entries list
+                failedEntries[failedCount++] = a;
+
+                // Break from the loop as we found the matching entry
+                break;
+            }
+
+            current = current->next;
+        }
+    }
+
+    if (failedCount > 0) {
+        add_failed_entry_LL_updated(failedEntries, failedCount);
+
+        // Prepare and send all tier addresses to delete_entry_LL_Addr
+        char** failedAddrs = malloc(failedCount * sizeof(char*));
+        if (failedAddrs == NULL) {
+            perror("Failed to allocate memory for failed addresses");
+            for (int i = 0; i < failedCount; i++) {
+                free(failedEntries[i]);
+            }
+            free(failedEntries);
+            return;
+        }
+
+        for (int i = 0; i < failedCount; i++) {
+            failedAddrs[i] = failedEntries[i]->tier_addr;
+        }
+		char** deletedLabels;
+		int deletedCount;
+        delete_entry_LL_Addr_updated(failedAddrs, failedCount, recvOnEtherPort, myTier, &deletedLabels, &deletedCount);
+		
+        // Free allocated memory for tier addresses
+        free(failedAddrs);
+    }
+  
+    // Free memory for failed entries
+    for (int i = 0; i < failedCount; i++) {
+        free(failedEntries[i]);
+    }
+    free(failedEntries);
+}
+
+

@@ -1,0 +1,4702 @@
+#include <sys/types.h>
+#include <netdb.h>
+#include <netinet/if_ether.h>
+#include <time.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/param.h>
+#include <ifaddrs.h>
+#include <unistd.h>
+#include <inttypes.h>
+#include <sys/time.h>
+#include <net/ethernet.h>
+#include <signal.h>
+#include <ctype.h>
+
+#include "helloList.h"
+#include "tierList.h"
+#include "genEnvironment.h"
+#include "errorControl.h"
+#include "printPacketDetails.h"
+#include "stringMessages.h"
+#include "fwdAlgorithmHelper.h"
+// #include "baseConversion.h"
+#include "endNetworkUtils.h"
+#include <pthread.h>
+
+//extern int ctrlSend(char eth[], char pay[]); //defined in sendMPLRCtrl.c
+extern int ctrlLabelSend(int, char eth[], char pay[]);//defined in send_MNLRAutoLabelCtrlMessages.c
+extern int dataSend(char etherPort[], unsigned char ipPacket[], char destTier[],char srcTier[], int ipPacketSize); // defined in send_MPLRData.c
+extern int endNetworkSend(char[], uint8_t*, int); //defined in send_MPLREndNW.c
+extern int dataFwd(char etherPort[20], unsigned char MPLRPacket[], int MPLRPacketSize); // defined in fwd_MPLRData.c
+extern int dataDecapsulation(char etherPort[20], unsigned char MPLRDecapsPacket[], int MPLRDecapsSize); // defined in fwd_MPLRDecapsulation.c 
+//extern int dataDecapsulationUDP(char etherPort[20], unsigned char MPLRDecapsPacket[], int MPLRDecapsSize); // Not used defined in fwd_MPLRDecapsulation.c 
+extern int packetForwardAlgorithm(char currentTier[], char desTier[]); //defined in fwdAlgorithm.c
+extern int isFWDFieldsSet(); // defined in fwdAlgorithm.c
+
+extern int isEnvSet(); // defined in updateEnvironment.c 
+extern int isTierSet(); // defined in updateEnvironment.c 
+extern int setTierInfo(char tierValue[]); // defined in updateEnvironment.c
+extern char* getTierInfo(); // defined in updateEnvironment.c
+extern int setControlIF(); // defined in updateEnvironment.c
+char failedInterface[20];
+extern void printIPPacketDetails(unsigned char ipPacket[], int nIPSize); // defined in printPacketDetails.h
+extern void printMPLRPacketDetails(unsigned char mplrPacket[], int nSize); // defined in printPacketDetails.h
+extern int CheckAllDestinationLabels(char* dest); // defined in fwdAlgorithm.c
+extern void printNeighbourTable(bool isRemoved); // defined in helloList.h
+void extractLabelSegments(char *label, int *tier, char **middleSegment, char **port);
+bool collect_neighbours_by_failedPort(char failedPort[5], char ***collectedLabels, int *labelCount);
+
+bool isDerivedLabel(char *middleSegment);
+void getDerivedLabelsFromNeighbourTable(char *middleSegment, char *failedAddrs[], int *failedCount);
+extern struct addr_tuple* failedLL_head;
+//extern void checkForLinkFailure(); // Not used 
+
+void checkEntriesToAdvertise(); 
+// void checkEntriesToUpdate(); // Not used 
+void checkForLinkFailures(struct addr_tuple*, int);
+bool isInterfaceActive(struct in_addr, int);
+void getMyTierAddresses();
+bool isDerivedFrom(char *receivedLabel);
+//void timestamp();  // Not used
+char** deleteLabelsAndCheckGrandparents(char** labels, int labelCount, int* totalDeletedCount);
+char** deleteLabelsForFailedInterface(char* failedInterface);
+//cur_tm - added to reduce the hello timer from sec to millisec  - 4/22/2022- Samruddhi
+struct timeval cur_tm; // to store current time 
+struct timeval convergence_time;
+void add_LL(char label[10]); // adds a new label - calls add_entry_LL in endNW.c
+
+char* interfaceList[10]; // list of interfaces in the node
+int interfaceListSize;  // number of interfaces in the node
+int actionflag = 1;      //To dodge messages when an interface comes up after being down
+bool churn_flag = false; // had an update of its tables - NS ?? which ones
+int down_flag = 0; // checking itnerfaces and printing time NS- ?? why
+// char specificLine[100]; //NS not used 
+// char payLoadTier[100]; //NS not used 
+char tierDest[12] = "0.0"; // to store tier addresses 
+time_t start_time; // used only once 
+char* ipPortToSkip;
+int LL_updated_flag=1;
+//time_t process_start_time; // NS ?? used only once not used anywhere else
+// time_t process_end_time;   // NS ?? used only once not used anywhere else
+// double process_timeDiff;  // NS - Never used ?? 
+double conv_time; // NS ?? do we need this.
+extern double d_time;
+extern struct timeval down_time; 
+// double end_conv_time; // NS - Never used ?? 
+// struct timeval process_before, process_after;
+struct addr_list* headaddr;  // NS to store IP addresses associated with labels or tier addresses
+struct addr_tuple* tablehead; // NS to understand the difference between addr_list and addrs_tuple
+
+char* tierAddr[20]; //this character array stores the tier address of format 1.2.3.4 etc
+char* ipAddress[16]; //this character array store the ip address of ip node
+int cidrs[100] = { 0 }; //subnet mask eg: 24
+char* portName[10]; // stores as a char array example ethx
+struct in_addr ips[100]; // ?? 
+char ip_add[20];  // storing IP addresses 
+
+// Structure to keep track of failed EndIPs
+struct addr_tuple* failedEndIPs_head = NULL;
+struct addr_tuple* failedAddr_head = NULL;
+
+// To count control messages - NS may have to delete, as we count the bytes - we dont use them 
+//long long int MPLRCtrlSendCount = 0;
+//long long int MPLRDataSendCount = 0;
+//long long int MPLRDataFwdCount = 0;
+//long long int MPLRCtrlSendRound = 0;
+// long long int ipReceivedCount = 0;
+//long long int MPLRCtrlReceivedCount = 0;
+//long long int MPLRDataReceivedCount = 0;
+//long long int MPLRMsgVReceivedCount = 0;
+// long long int MPLROtherReceivedCount = 0;
+// long long int MPLRDataReceivedCountForMe = 0; // NS ?? not used 
+// long long int MPLRDecapsulated = 0;
+
+//long long int errorCount = 0;  // ?? 
+int totalIPError = 0;  // NS ?? not used 
+int finalARGCValue = -100;  // used for collecting argc in main 
+int endNode = -1; // Is it an edge node or not 
+
+int myTierValue = -1; // assigned when the code is started. Can be 1, 2 or 3
+// int tierAddrCount = 0;  // NS not used 
+int enableLogScreen = 1; //flag to set whether logs need to be shown in screen
+bool recvdLabel = false;  // ?? 
+int programStableFlag = 0; // Is set after 75 seconds of program start. 
+
+// Storage for a node's labels 
+struct labels {
+	char label[100];
+	struct labels* next;
+};
+
+// To store The labels allocated to each child node.
+struct labels* allocatedLabels = NULL; 
+
+// To keep the track of the children to give new names?? 
+int myChildCount = 0;
+
+int freqCount(char str[], char search); // method to find count of particular character
+int setInterfaces(); // record active interfaces in a list
+int freeInterfaces(); // free interfaces stored in the list
+int generateChildLabel(char* myEtherPort, int childTier, struct labels** labelList);
+void addLabelsList(struct labels* labelList, char label[]);
+void joinChildTierParentUIDInterface(char childLabel[], char myTierAddress[], char myEtherPort[]);
+void printMyLabels();
+
+// handling different message types 
+void hello_msg(char[2048], unsigned char*, char[5], struct sockaddr_ll); 
+void encaps_ip_msg(char[2048], unsigned char*, char[5], struct sockaddr_ll, int*);
+void ip_tier_mapping_msg(char[2048], unsigned char*, char[5], struct sockaddr_ll);
+void msg_typ_join(char[2048], unsigned char*, char[5], struct sockaddr_ll);
+void msg_typ_labl_available(char[2048], unsigned char*, char[5], struct sockaddr_ll);
+void msg_typ_labl_accptd(char[2048], unsigned char*, char[5], struct sockaddr_ll);
+void msg_typ_labl_add(char[2048], unsigned char*, char[5], struct sockaddr_ll);
+void msg_typ_labl_delt(char[2048], unsigned char*, char[5], struct sockaddr_ll);
+void msg_typ_rqst_ip(char[2048], unsigned char*, char[5], struct sockaddr_ll);
+void msg_typ_ip_res(char[2048], unsigned char*, char[5], struct sockaddr_ll, int*);
+void msg_typ_labl_lst(char[2048], unsigned char*, char[5], struct sockaddr_ll);
+void msg_typ_ip_delt(char[2048], unsigned char*, char[5], struct sockaddr_ll);
+void msg_typ_ip_add(char[2048], unsigned char*, char[5], struct sockaddr_ll, int*);
+bool delete_neighbour(char* failedAddrs[], int failedCount, char recvOnEtherPort[5]);
+bool delete_neighbour_by_failedPort(char failedPort[5]);
+void publishIPLabelMap_updated(char* deletedLabels[], int deletedCount, int action, char recvOnEtherPort[5], bool if_down_tier1);
+void notify_lostmyparent(char failedPort[20]);
+extern int myTotalTierAddress;
+
+
+// Define a structure for the global processed labels list
+typedef struct ProcessedLabel {
+    char *label;
+    struct ProcessedLabel *next;
+} ProcessedLabel;
+
+ProcessedLabel *processedLabels = NULL;
+pthread_mutex_t processedLabelsMutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Function to check if a label has been processed
+bool is_label_processed(const char *label) {
+    pthread_mutex_lock(&processedLabelsMutex);
+
+    ProcessedLabel *current = processedLabels;
+    while (current != NULL) {
+        if (strcmp(current->label, label) == 0) {
+            pthread_mutex_unlock(&processedLabelsMutex);
+            return true;
+        }
+        current = current->next;
+    }
+
+    pthread_mutex_unlock(&processedLabelsMutex);
+    return false;
+}
+
+// Function to add a label to the processed list
+void add_processed_label(const char *label) {
+    pthread_mutex_lock(&processedLabelsMutex);
+
+    ProcessedLabel *newLabel = malloc(sizeof(ProcessedLabel));
+    newLabel->label = strdup(label);
+    newLabel->next = processedLabels;
+    processedLabels = newLabel;
+
+    pthread_mutex_unlock(&processedLabelsMutex);
+}
+
+// Function to remove a label from the processed labels list
+void remove_processed_label(const char *label) {
+    pthread_mutex_lock(&processedLabelsMutex);
+
+    ProcessedLabel *current = processedLabels;
+    ProcessedLabel *previous = NULL;
+
+    while (current != NULL) {
+        if (strcmp(current->label, label) == 0) {
+            // Found the label, remove it from the list
+            if (previous == NULL) {
+                // Removing the head
+                processedLabels = current->next;
+            } else {
+                previous->next = current->next;
+            }
+            free(current->label);
+            free(current);
+            pthread_mutex_unlock(&processedLabelsMutex);
+            return;
+        }
+        previous = current;
+        current = current->next;
+    }
+
+    pthread_mutex_unlock(&processedLabelsMutex);
+}
+
+
+//Ignores control characters such as SOH, STX, BEL ,etc
+void filterControlChars(char* str) {
+	int len = strlen(str);
+	for (int i = 0; i < len; i++) {
+		if (str[i] < 32) {
+			continue;
+		}
+		// printf("%c", str[i]);
+	}
+}
+
+// calculates the time difference in micro seconds
+double time_diff(struct timeval before, struct timeval after)
+{
+	double x_ms, y_ms, diff;
+	x_ms = (double)before.tv_sec * 1000000 + (double)before.tv_usec;
+	y_ms = (double)after.tv_sec * 1000000 + (double)after.tv_usec;
+	diff = (double)y_ms - (double)x_ms;
+	return diff;
+}
+
+// removes unwanted characters from stdin - Keyboard
+void clean_stdin(void)
+{
+	int c;
+	do {
+		c = getchar();
+	} while (c != '\n' && c != EOF);
+}
+
+// boolean updateEndDestinationTierAddrHC(char tempIP[]) - 
+// changed this to send my label to requestIPResponse. 02/07/2022 -- Samruddhi 
+boolean updateEndDestinationTierAddrHC(char tempIP[], char Mytier[]) {
+	deleteList();
+	boolean updateStatus = false;
+	char* tempTier = updateEndTierAddr(tempIP, Mytier);
+	if (tempTier != NULL) {
+		strcpy(tierDest, tempTier);
+		updateStatus = true;
+	}
+	return updateStatus;
+}
+
+/******************************
+* _get_MACTest(int,char[])
+* method to send and receive MPLR, IP messages in one thread with timeout mechanism
+* @param conditionVal (int) - condition for execution
+* @param specialParam (char[]) - optinal parameters : separated by #
+* @return status (int) - method return value
+******************************/
+int _get_MACTest(struct addr_tuple* myAddr) {
+
+	//if (enableLogScreen)
+		//printf("\n EIBP started  ... \n");
+
+	//Below 2 lines are added to reduce the hello timer from sec to millisec  - 4/22/2022- Samruddhi
+	double time00;
+	double time01;
+
+	int sock, n; //declare 2 integer variables for sock
+	int sockIP, nIP; //declare 2 integer variables for socketIp and nIO
+	// int sockUDP, nUDP; // 
+
+	char buffer[2048]; // to store EIBP control messages 
+	char bufferIP[2048]; // to store IP packets 
+
+	unsigned char* ethhead = NULL;
+	unsigned char tempIP[1500];
+	struct ether_addr ether;
+
+	char recvOnEtherPort[5];
+	char recvOnEtherPortIP[5];
+	// char MACString[18];
+
+	struct sockaddr_ll src_addr;
+	struct sockaddr_ll src_addrIP;
+
+	recvOnEtherPort[5] = '\0';
+
+	// Creating the CONTROL SOCKET to handle EIBP control messages 
+	if ((sock = socket(AF_PACKET, SOCK_RAW, htons(0x8850))) < 0) {
+		//errorCount++;
+		perror("ERROR: EIBP Socket ");
+		printf("\nERROR: EIBP Socket ");
+	}
+
+	// Creating the SOCKET toi handle Ip packets 
+	if ((sockIP = socket(AF_PACKET, SOCK_RAW, htons(0x0800))) < 0) {
+		//errorCount++;
+		perror("ERROR: IP Socket ");
+		printf("\nERROR: IP Socket ");
+	}
+
+	char ctrlPayLoadA[200];
+	memset(ctrlPayLoadA, '\0', 200);
+	uint8_t numOfAddr = (uint8_t)getCountOfTierAddr();
+	memcpy(ctrlPayLoadA, &numOfAddr, 1); // NS - memory of numAddr stored in ctrlPayLoadA
+	int cpLength = 1;
+
+	int q = 0; //size of the tier address and tier Address is copied to cntrlPayLoadA in the below for loop
+	for (; q < numOfAddr; q++) {
+		char tempAddrA[20];
+		memset(tempAddrA, '\0', 20);
+		strcpy(tempAddrA, getTierAddr(q)); //copy the qth tier address to tempAddrA
+		freeGetTierAddr(); //free the tier address field
+
+		uint8_t localTierSizeA = strlen(tempAddrA);
+
+		memcpy(ctrlPayLoadA + cpLength, &localTierSizeA, 1);
+		cpLength = cpLength + 1;
+		memcpy(ctrlPayLoadA + cpLength, tempAddrA, localTierSizeA);
+		cpLength = cpLength + localTierSizeA;
+
+		// printf("Control PayLoad %d --- ", q);
+		filterControlChars(ctrlPayLoadA); //Added a function to print without control characters such as SOH, STX, BEL ,etc.
+		//printf("\n");
+	}
+	// sending my tier addresses on active interfaces
+	setInterfaces(); //interfaceList is being set by this function
+	int loopCounter1 = 1; //this for loop sends the control message as well as keeps track of the no of control messages sent
+	for (; loopCounter1 < interfaceListSize; loopCounter1++) {
+		//ctrlSend(interfaceList[loopCounter1], ctrlPayLoadA); //ctrlSend method is used to send Ethernet frame(list of all tier addresses)
+		//Tejas Addition
+		//if((myTierValue == 3 && strcmp(interfaceList[loopCounter1],ipPortToSkip)==0))==0){
+		//		continue;
+		//}
+		if((myTierValue == 3 && strcmp(interfaceList[loopCounter1],ipPortToSkip)==0) || strcmp(interfaceList[loopCounter1],failedInterface)==0){
+				continue;
+		}
+		ctrlLabelSend( MESSAGE_TYPE_CTRL, interfaceList[loopCounter1], ctrlPayLoadA); 
+		//MPLRCtrlSendCount++; //keeps track of the no of control messages sent
+	//	printf("Control message sent on interface %s\n", interfaceList[loopCounter1]);
+	}
+	//Below 2 lines are added to reduce the hello timer from sec to millisec - 4/22/2022- Samruddhi
+	//gettimeofday(&cur_tm, NULL);
+	time00 = getCurrentTime();
+	// printMyLabels();
+	print_entries_LL();
+	// printf("\n Processing messages now...\n");
+
+	char labelAssignmentPayLoad[200];
+	setInterfaces();
+	int cplength = 0;
+	
+	memset(labelAssignmentPayLoad, '\0', 200); // Clearing the payload
+	uint8_t tierValue = (uint8_t)myTierValue; // Setting the tierValue
+	memcpy(labelAssignmentPayLoad + cplength, &tierValue, 1);
+	if (myTierValue != 1) { // nodes in tier 2 and 3 will send null join request
+		//printf("\n Sending NULL join request on all interfaces, "
+		//	"interfaceListSize = %d payloadSize=%d", interfaceListSize, (int)strlen(labelAssignmentPayLoad));
+		printf("\nSending NULL join request on all interfaces, interfaceListSize = %d CURRENT_TIME:%lf", interfaceListSize,getCurrentTime());	
+		// Send NULL Join Message (Message Type, Tier Value) to all other nodes
+		for (int i = 1; i < interfaceListSize; i++) {
+			//Tejas Addition
+			if((myTierValue == 3 && strcmp(interfaceList[i],ipPortToSkip)==0) || strcmp(interfaceList[i],failedInterface)==0){
+					continue;
+				}
+
+			ctrlLabelSend(MESSAGE_TYPE_JOIN, interfaceList[i], labelAssignmentPayLoad);
+		}
+	}
+	freeInterfaces();
+	interfaceListSize = 0;
+
+	while(1) { // continuos loop 
+		// process_end_time = time(0);
+		int flag = 0; // set when ctrl message received
+		int flagIP = 0; // set when IP packet received
+		char ctrlPayLoadB[200];
+
+		//Below 2 lines are added to reduce the hello timer from sec to millisec - 4/22/2022- Samruddhi
+		//gettimeofday(&cur_tm, NULL);
+		time01 = getCurrentTime();
+
+		/***** KCT 01-19-2023 Adds back any entries for any endnodes that have become active again after failure
+		Also checks if we have any new end node link failure and removes entries from the tier 1
+		table for failed endnodes ****/
+		if (!endNode) {
+			// Adds entries for failed endnodes that became active and stores failed nodes into failedEndIPs_head
+			checkForLinkFailures(myAddr, 0);
+			if (failedEndIPs_head != NULL) { // if we have new failed IPs then Advertise.
+				printf("Noted a failed IP\n");
+				setInterfaces(); //interfaceList is being set by this function
+				int loopCounter2 = 1;
+				int port_number = 0;
+				uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET);
+				int mplrPayloadLen = 0;
+				// builds payload that is used for advertising TierAdd<->Ipaddress entries. - KCT 01-19-2023
+				printf("before sending buildPayloadRemoveAdvts5");
+				mplrPayloadLen = buildPayloadRemoveAdvts(mplrPayload, failedEndIPs_head, 2);
+				if (mplrPayloadLen) {
+					for (; loopCounter2 < interfaceListSize; loopCounter2++) {
+						// MPLR TYPE 5. KCT - 01-19-2023 - NS check this?
+						// matchPort return the corressponding port tag for each interface by comparing value of interfaceList
+						// 1 is for same level neighbours
+						// 2 is for child interface
+						// 3 is for parent interface
+						port_number = matchPort(interfaceList[loopCounter2]);
+						if (port_number == 3) {
+							// KCT 01-19-2023
+							// sends endNW type message to parent interface to add TierAdd<->Ipaddress  
+							// entries of the recovered end node to tier 1 table
+							endNetworkSend(interfaceList[loopCounter2], mplrPayload, mplrPayloadLen);
+							printf("sending message type V failed IP\n"); // NS ?? make it sensible 
+						}
+					}
+				}
+				free(mplrPayload);
+				freeInterfaces();
+				interfaceListSize = 0;
+			}
+		} // end if (!endNode)
+
+		checkEntriesToAdvertise();
+
+		//Send hello packets after every 0.1 seconds 
+		if (time01 - time00 > 0.25) {  //Hello timer (from 1.2 to 0.25 to 0.1 seconds ) and dead timer(from 1.3 to 0.4 to 0.15) reduced 4/20/2022 - Samruddhi, Kct
+			//printf("sending hello message\n");
+			// Pending - No need to send all the addresses evry time, need to work on that - 07/02/2021
+		 	//gettimeofday(&current_time, NULL);
+			memset(ctrlPayLoadB, '\0', 200);
+			uint8_t numOfAddrB = getCountOfTierAddr();
+			memcpy(ctrlPayLoadB, &numOfAddrB, 1);
+			cpLength = 1;
+			int qq = 0;
+			for (; qq < getCountOfTierAddr(); qq++) {
+				char tempAddrB[20];
+				memset(tempAddrB, '\0', 20);
+				strcpy(tempAddrB, getTierAddr(qq));
+				freeGetTierAddr();
+				uint8_t localTierSizeB = strlen(tempAddrB);
+				memcpy(ctrlPayLoadB + cpLength, &localTierSizeB, 1);
+				cpLength = cpLength + 1;
+				memcpy(ctrlPayLoadB + cpLength, tempAddrB, localTierSizeB);
+				cpLength = cpLength + localTierSizeB;
+			}
+
+			// Send on multiple interface in a loop
+			setInterfaces(); //interfaceList is being set by this function
+			int loopCounter2 = 1;
+			for (; loopCounter2 < interfaceListSize; loopCounter2++) {
+				//ctrlSend(interfaceList[loopCounter2], ctrlPayLoadB); //send control messages on all the interfaces related to that node
+				//Tejas Addition
+				if((myTierValue == 3 && strcmp(interfaceList[loopCounter2],ipPortToSkip)==0) || strcmp(interfaceList[loopCounter2],failedInterface)==0){
+					continue;
+				}
+				//if((myTierValue == 3 && strcmp(interfaceList[loopCounter2],ipPortToSkip)==0))==0){
+				//	continue;
+				//}
+				ctrlLabelSend(MESSAGE_TYPE_CTRL, interfaceList[loopCounter2], ctrlPayLoadB);
+				//MPLRCtrlSendCount++;
+				//printf("Send hello message at time : %ld.%06ld ------ on interface %s\n\n", current_time.tv_sec, current_time.tv_usec, interfaceList[loopCounter2]);
+				//printf("Send Hello message on interface: %s\n\n", interfaceList[loopCounter2]); 
+			}
+
+			int ck = 0;
+			time_t current_time = time(0);
+			double delTimeDiff = difftime(current_time, start_time);
+			if (delTimeDiff > 75) {  // after 75 seconds check for any deletes 
+				//printf("checking for deletes \n"); //kriti added
+				ck = delete(recvOnEtherPort);
+				// printf("\nDelete function called \n");
+				programStableFlag = 1; // NS - 4-4-2024
+			}
+			if (ck == 1) {
+				churn_flag = true;
+				//gettimeofday(&down_time, NULL);
+				
+				
+				//printf("\nNeighbour Table after removing the addresses of the unreachable node CURRENT_TIME:%lf",getCurrentTime());
+				//timestamp();
+				printNeighbourTable(true);
+				printf("\nMy Label Table after removing unreachable node");
+				//timestamp();
+				printMyLabels();
+				if (failedLL_head != NULL) { // when tier addreeses are deleted they are stored in FailedLL_head
+					actionflag = 0;
+					int loopCounter2 = 1;// dont send on eth0 hence changed it to 1
+					uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET);
+					int mplrPayloadLen = 0;
+					int port_number = 0;
+					printf("before sending buildPayloadRemoveAdvts4");
+					mplrPayloadLen = buildPayloadRemoveAdvts(mplrPayload, failedLL_head, 4);
+					if (mplrPayloadLen) {
+						for (; loopCounter2 < interfaceListSize; loopCounter2++) {
+							// MPLR TYPE 5.
+							port_number = matchPort(interfaceList[loopCounter2]);
+							if (port_number == 3) {
+								endNetworkSend(interfaceList[loopCounter2], mplrPayload, mplrPayloadLen);
+							}
+							if (myTierValue == 1 && port_number == 1) {
+								endNetworkSend(interfaceList[loopCounter2], mplrPayload, mplrPayloadLen);
+							}
+						}
+					}
+					free(mplrPayload);
+					interfaceListSize = 0;
+					delete_failed_LL_Addr(failedLL_head);
+				}
+
+				if (myTierValue == 1 || myTierValue == 3) {
+					printf("\nUpdated Label List");
+					//timestamp();
+					print_entries_LL();
+				}
+			}
+			// time0 = time(0); //reset time0
+			//gettimeofday(&cur_tm, NULL);
+			time00 = getCurrentTime();
+			freeInterfaces();
+			interfaceListSize = 0;
+			//MPLRCtrlSendRound++;
+		}
+
+		socklen_t addr_len = sizeof src_addr;
+		socklen_t addr_lenIP = sizeof src_addrIP;
+		// Recieve messages from the IP socket created //NS - nIP has the packet size in bytes
+		nIP = recvfrom(sockIP, bufferIP, 2048, MSG_DONTWAIT,
+			(struct sockaddr*)&src_addrIP, &addr_lenIP); //inbuilt function to recieve information from socket. If there is any message in socket, we recieve a avalue greater than -1 and if there is no message, -1 will be returned.
+		if (nIP == -1) {
+			flagIP = 1; //if no message is there in socket, nIP is -1 and flagIP is set to 1
+		}
+		// if some messages are available in the IP socket. //if message is recived from socket flagIP remains 0 and we enter the loop
+		if (flagIP == 0) { 
+			unsigned int tcIP = src_addrIP.sll_ifindex;
+			if_indextoname(tcIP, recvOnEtherPortIP); //if_indextoname() function returns the name of the network interface corresponding to the interface index ifindex
+			// Fix for testbed, Ignoring messages from control interface // Interface names
+			char* ctrlInterface = "eth0";
+			char* loopbackInterface = "lo";
+			char* measInterface = "meas";
+			char* dockerInterface = "docker0";
+			// Check if the received message is from any of the specified interfaces
+			if (strcmp(recvOnEtherPortIP, ctrlInterface) == 0 ||
+				strcmp(recvOnEtherPortIP, loopbackInterface) == 0 ||
+				strcmp(recvOnEtherPortIP, measInterface) == 0 ||
+				strcmp(recvOnEtherPortIP, dockerInterface) == 0)
+				// Ignore messages from these interfaces
+				continue; 
+				// ipReceivedCount++;
+				if (enableLogScreen) {
+				//	printf("\n The control interface is %s", ctrlInterface); 
+					printf("\n IP Packet Received On port %s\n", recvOnEtherPortIP);
+				}
+				unsigned char* ipHeadWithPayload;
+				int ipPacketSize = nIP - 14;
+				ipHeadWithPayload = (unsigned char*)malloc(ipPacketSize);
+				memset(ipHeadWithPayload, '\0', ipPacketSize);
+				memcpy(ipHeadWithPayload, &bufferIP[14], ipPacketSize);
+				printf("\n");
+				setInterfaces(); //interfaceList is being set by this function
+
+				unsigned char ipDestTemp[20];
+				sprintf(ipDestTemp, "%u.%u.%u.%u", ipHeadWithPayload[16],
+					ipHeadWithPayload[17], ipHeadWithPayload[18],
+					ipHeadWithPayload[19]);
+				printf("[2]\nIP Destination : %s  \n", ipDestTemp);
+
+				unsigned char ipSourceTemp[20];
+				memset(ipSourceTemp, '\0', 20);
+				sprintf(ipSourceTemp, "%u.%u.%u.%u", ipHeadWithPayload[12],
+					ipHeadWithPayload[13], ipHeadWithPayload[14],
+					ipHeadWithPayload[15]);
+				// if (enableLogFiles)
+				printf("\nIP Source  : %s  \n", ipSourceTemp);
+				printf("\nCalling Forwarding Algorithm - DataSend\n");
+
+				int packetFwdStatus = -1;
+				if (isTierSet() == 0) {
+					boolean checkDestStatus = updateEndDestinationTierAddrHC(ipDestTemp, headTL->tier);
+					if (checkDestStatus == false) {
+						//errorCount++;
+						printf("\n End destination tier address for IP address not available in the node \n");
+					}
+					else {
+						printf("\n Calling packetForwardAlgorithm linenumber =%d", __LINE__);
+						setTierInfo(headTL->tier);
+						packetFwdStatus = packetForwardAlgorithm(tierAddress,tierDest);
+						printf("\n**interface: %s \n", fwdInterface);
+					}
+				}
+				else {
+					printf("\nERROR: Tier info was not set\n");
+					printf("\n Calling packetForwardAlgorithm linenumber =%d", __LINE__);
+					setTierInfo(headTL->tier);
+					packetFwdStatus = packetForwardAlgorithm(tierAddress, tierDest);
+				}
+
+				if (packetFwdStatus == 0) {
+					if ((strlen(fwdTierAddr) == strlen(tierAddress))
+						&& (strcmp(fwdTierAddr, tierAddress) == 0)) {
+						printf(" \nReceived IP packet - for me, no forwarding needed) \n"); // NS what is happening here
+					}
+					else {
+						if (isFWDFieldsSet() == 0) {
+							printf("\nForwarding IP Packet as EIBP Data Packet (Encapsulation) \n");
+							printf("\nSending on interface: %s \n", fwdInterface);
+							dataSend(fwdInterface, ipHeadWithPayload, tierDest,
+								tierAddress, ipPacketSize);
+							// MPLRDataSendCount++;
+						}
+					}
+				}
+				freeInterfaces();
+				interfaceListSize = 0;
+		}
+		
+		n = recvfrom(sock, buffer, 2048, MSG_DONTWAIT,
+			(struct sockaddr*)&src_addr, &addr_len); // Receive messages from the control socket.
+
+		if (n == -1) {
+			flag = 1;
+		}
+
+		if (flag == 0) { // if some message is present in the control socket.
+			unsigned int tc = src_addr.sll_ifindex;
+			if_indextoname(tc, recvOnEtherPort); //mappings between network interface names and indexes
+			ethhead = (unsigned char*)buffer;
+			if (ethhead != NULL) {
+				//MPLROtherReceivedCount++;
+				uint8_t checkMSGType = (ethhead[14]);
+				/********************************* 
+				Checking for different types of EIBP messages
+				0x01 = Hello Message - MESSAGE_TYPE_CTRL
+				0x02 = Encapsulated IP Message
+				0x05 = IP to Tier Address Mappping message
+					Actions under message 0x05:
+						action == MESSAGE_TYPE_ENDNW_INTER_IP
+						action == MESSAGE_TYPE_ENDNW_ADD
+						action == MESSAGE_TYPE_ENDNW_UPDATE
+						action == MESSAGE_TYPE_ENDNW_REMOVE
+						action == MESSAGE_TYPE_ENDNW_REMOVE_ADDR
+						action == MESSAGE_TYPE_ENDNW_REMOVE
+						action == MESSAGE_TYPE_ENDNW_REMOVE_ADDR
+
+				Below  are the ones for auto naming.
+				0x07 = MESSAGE_TYPE_JOIN
+				0x08 = MESSAGE_TYPE_LABELS_AVAILABLE
+				0x09 = MESSAGE_TYPE_LABELS_ACCEPTED
+				0x10 = MESSAGE_TYPE_MY_LABELS_ADD
+				0X11 = MESSAGE_TYPE_MY_LABELS_DELETE
+				0x12 = REQUEST-IP-RESOLVE (from T3 to T1 node)
+				0x13 = RESPONSE-IP-RESOLVE (from T1 to T3 node)
+				0X14 = MESSAGE_TYPE_LABELS_LOST
+				0x15 = MESSAGE_TYPE_PUBLISH_IP_DELETE : sent by T1 node
+				0x16 = MESSAGE_TYPE_PUBLISH_IP_ADD : sent by T1 node
+				**********************************************/
+
+				if (strcmp(recvOnEtherPort, "eth0") != 0) {
+					if (checkMSGType != MESSAGE_TYPE_CTRL) {
+						//printf("\ncheckMSGType=%d\n", checkMSGType);
+					}
+					switch (checkMSGType) {
+					case MESSAGE_TYPE_CTRL:
+						//printf("\n Received Message Type is MESSAGE_TYPE_CTRL - Hello\n");
+						hello_msg(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_DATA:
+						//printf("\n Received Message Type is MESSAGE_TYPE_DATA\n");
+						encaps_ip_msg(buffer, ethhead, recvOnEtherPort, src_addr, &n);
+						break;
+					case MESSAGE_TYPE_ENDNW: //Ip to Tier address message type 0x05
+						printf("\n in switch ip_tier_mapping_msg\n");
+						ip_tier_mapping_msg(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_JOIN:
+						//printf("\n Received Message Type is MESSAGE_TYPE_JOIN\n");
+						msg_typ_join(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_LABELS_AVAILABLE:
+						//printf("\n Received Message Type is MESSAGE_TYPE_LABELS_AVAILABLE\n");
+						msg_typ_labl_available(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_LABELS_ACCEPTED:
+						//printf("\n Received Message Type is MESSAGE_TYPE_LABELS_ACCEPTED\n");
+						msg_typ_labl_accptd(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_MY_LABELS_ADD:
+						//printf("\n Received Message Type is MESSAGE_TYPE_MY_LABELS_ADD\n");
+						msg_typ_labl_add(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_MY_LABELS_DELETE:
+						//printf("\n Received Message Type is MESSAGE_TYPE_MY_LABELS_DELETE\n");
+						msg_typ_labl_delt(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_REQUEST_IP_RESOLVE:
+						//printf("\n Received Message Type is MESSAGE_TYPE_REQUEST_IP_RESOLVE\n");
+						msg_typ_rqst_ip(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_RESPONSE_IP_RESOLVE:
+						// printf("\n Received Message Type is MESSAGE_TYPE_RESPONSE_IP_RESOLVE\n");
+						msg_typ_ip_res(buffer, ethhead, recvOnEtherPort, src_addr, &n);
+						break;
+					case MESSAGE_TYPE_LABELS_LOST:
+						//printf("\n Received Message Type is MESSAGE_TYPE_LABELS_LOST\n");
+						msg_typ_labl_lst(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_PUBLISH_IP_DELETE:
+						//printf("\n Received Message Type is MESSAGE_TYPE_PUBLISH_IP_DELETE\n");
+						msg_typ_ip_delt(buffer, ethhead, recvOnEtherPort, src_addr);
+						break;
+					case MESSAGE_TYPE_PUBLISH_IP_ADD:
+						//printf("\n Received Message Type is MESSAGE_TYPE_PUBLISH_IP_ADD\n");
+						msg_typ_ip_add(buffer, ethhead, recvOnEtherPort, src_addr, &n);
+						break;
+					}
+					// question
+					if (checkMSGType != MESSAGE_TYPE_CTRL && checkMSGType != MESSAGE_TYPE_DATA && checkMSGType != MESSAGE_TYPE_REQUEST_IP_RESOLVE &&
+						checkMSGType != MESSAGE_TYPE_RESPONSE_IP_RESOLVE) {
+						//gettimeofday(&down_time, NULL);
+						//conv_time = ((double)convergence_time.tv_sec * 1000000 + (double)convergence_time.tv_usec) / 1000000;
+						//d_time = getCurrentTime();
+						//printf("\nCURRENT_TIME:%lf\t", conv_time); // time at which the node receives a message and processes it correctly 
+						printf("\nMessage type is %d  received on port %s at CURRENT_TIME:%lf",checkMSGType, recvOnEtherPort, getCurrentTime());
+						printf("\nETH_SIZE:%d\n", sizeof(unsigned char)*strlen(ethhead));
+						if (churn_flag == true) {
+							printf("CHURN_TRUE\n");
+						}
+						churn_flag = false;
+					}
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+/********************************************************
+* setInterfaces() //interfaceList is being set by this function
+* method to set active interfaces in a interfaceList
+* @return status (int) - method return value
+********************************************************/
+int setInterfaces() {
+
+    if (isEnvSet() != 0)
+        setControlIF();
+    struct ifaddrs* ifaddr, * ifa;
+    int family;
+    int countInterface = 0;
+    char temp[20];
+	char lostInterface[20] = "";
+    if (getifaddrs(&ifaddr) == -1) { 
+	/*The getifaddrs() function creates a linked list of structures describing the
+	 network interfaces of the local system, and stores the address of the first item of the list in *ifap.*/
+        // errorCount++;
+        perror("ERROR: getifaddrs");
+        exit(EXIT_FAILURE);
+    }
+    int init = 0;
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+        family = ifa->ifa_addr->sa_family;
+        if (family == AF_PACKET) {
+            strcpy(temp, ifa->ifa_name);// interface name
+           // printf("\n START: Interface: %s, Flags: %d\n", ifa->ifa_name, ifa->ifa_flags); // Print interface name and flags
+
+            if (strcmp(temp, "meas") == 0 || strcmp(temp, "docker0") == 0)  // Ignore the "meas" and "docker0" interfaces
+                continue; // Skip processing these interfaces
+            
+            if ((ifa->ifa_flags & IFF_UP) == 0) { // testing whether interface is up or not
+                //if interface is down
+                if (down_flag == 0) { // doing it the first time only - NS ?? why
+                    //gettimeofday(&down_time, NULL);
+                    //d_time = ((double)down_time.tv_sec*1000000 + (double)down_time.tv_usec) / 1000000;
+                    printf("\nIF_DIRECT_DOWN:%lf\n", getCurrentTime());
+                    down_flag = 1;
+					
+					strcpy(lostInterface, ifa->ifa_name);
+					strcpy(failedInterface,lostInterface);
+					
+
+                }
+			//printf("\n IN THE LOOP: Interface: %s, Flags: %d, interface size: %d\n", ifa->ifa_name, ifa->ifa_flags, interfaceListSize);
+            }
+            else {
+				
+                if ((ifa->ifa_flags & IFF_LOOPBACK) == 0) { // if not loop_back 
+                    if (ctrlIFName != NULL) {
+                        if (strlen(temp) == strlen(ctrlIFName)) {
+                            if ((strncmp(temp, ctrlIFName, strlen(ctrlIFName))
+                                != 0)) {
+                                countInterface = countInterface + 1;
+                                interfaceList[init] = malloc(1 + strlen(temp));
+                                strcpy(interfaceList[init], temp);
+                                init = init + 1;
+                            }
+                        }
+                        else {
+                            countInterface = countInterface + 1;
+                            interfaceList[init] = malloc(1 + strlen(temp));
+                            strcpy(interfaceList[init], temp);
+                            init = init + 1;
+                        }
+                    }
+                    else {
+                        countInterface = countInterface + 1;
+                        interfaceList[init] = malloc(1 + strlen(temp));
+                        strcpy(interfaceList[init], temp);
+                        init = init + 1;
+                    }
+                }
+				
+            }
+        }
+    }
+    interfaceListSize = countInterface;
+	//printf("\nInterfacelist size = %d", interfaceListSize);
+	if(strlen(lostInterface) > 0){
+		printf("\nFailed interface: %s\n",lostInterface);
+		notify_lostmylabels_direct_down(lostInterface);
+		deleteStable(lostInterface);
+	}
+	
+    freeifaddrs(ifaddr);
+    return 0;
+}
+
+
+/************************************************
+* freeInterfaces()- method to free interfaceList
+* @return status (int) - method return value
+************************************************/
+int freeInterfaces() {
+	int loopCounter1 = 0;
+	for (; loopCounter1 < interfaceListSize; loopCounter1++) {
+		free(interfaceList[loopCounter1]);
+	}
+	interfaceListSize = 0;
+	return 0;
+}
+
+/************************************************
+* convertStringToInteger()
+* Method which converts the passed string into integer.
+* @return status (int) - method returns integer value of the string.
+*************************************************/
+int convertStringToInteger(char* num)
+{
+	int result = 0, i = 0;
+	int len = strlen(num);
+	for (i = 0; i < len; i++) {
+		result = result * 10 + (num[i] - '0');
+	}
+	//printf("%d", result);
+	return result;
+}
+
+/*************************************************
+*  Main starts here. we collect the input arguments from the command line
+* we then pass control to get_MAC()
+*************************************************/
+int main(int argc, char** argv) {
+	/* The 2 arguments are argc, which is the no of arguments, and argv, which is a pointer of pointers to each of the arguments
+	E.g., ./run -T 2.1.2 -N 0 10.10.5.2 24 eth1. 7 components are present in this argument, hence argc is 7
+	The arguments are:
+	1) -T - stands for tier label
+	2)2.1.2 - tier label address
+	3)-N - stands for Node
+	4)0 - 0 specifies edge node and 1 specifies non edge node
+	5)10.10.5.2 - ip address of the ip node
+	6)24 - subnet mask
+	7)eth1 - interface through which the ip node is connected to edge node. */
+	//As the argument comes as a pointer of pointers we  split and save them to following variables:
+	//char *tierAddr[20]; to store the tier address 
+	//char *ipAddress[16]; store the ip address of network connected to edge node
+	//int cidrs[100] = { 0 }; subnet mask eg: 24
+	//char *portName[10]; //interface  or port no such as 'eth0'
+	int endNWCount = 0;
+	start_time = time(0);
+
+	if (argc > 1) { //only if the number of arguments is greater than 1, we proceed else exit code execution
+		argc--; //decrement the counter
+		argv++; //increment the memory location. first value in argv is "./run". Now we incremented to "-T" 
+		char* opt = argv[0]; //declare a pointer and assign the first pointer in "argv" to "opt". {*argv = argv[0]}. "-T"  assigned to opt
+		if (strcmp(opt, "-T") == 0) { // Checking for -T and storing Tier in myTierValue
+			argc--;
+			argv++;	//argv is now on Tier Value. E.g., -T 2. argv is on '2'.
+			myTierValue = convertStringToInteger(argv[0]);
+			argc--;
+			argv++; //argv now points to the next argument
+		}
+		else {
+			printf(" \nError : Invalid Argument , Tier Value is not passed\n ");
+			exit(0);
+		}
+
+		printf("\nMy Tier Value = %d\n", myTierValue);
+		
+		if (myTierValue == 1) // Checking if the current node belongs to Tier 1 
+		{
+			opt = argv[0];
+			if (strcmp(opt, "-L") == 0) { // Checking for -L
+				argc--;
+				argv++;
+				char* next = argv[0];
+				// - Team KCT 01/02/2023 -
+				// setTierInfo() can be removed as it does the same work as insertTierAddr(), but it currently sets values 
+				// that are used in multiple locations. All of them need to be altered and then remove setTierInfo
+				//function to set the tier address of the node. we are passing the tier label address(eg 1.1) as the argument.
+				setTierInfo(next);
+				insertTierAddr(next); //pass it to list of tier addresses of the node.
+				// Here it is core router so only a single Tier Addr is inserted.
+				tierAddr[0] = malloc(1 + strlen(next));
+				strcpy(tierAddr[0], next);
+				argc--;
+				argv++;
+				printf("\n tierAddr of Tier 1 Node = %s\n", tierAddr[0]);
+			}
+			else {
+				printf(" \n Error : Invalid Argument , Label not assigned to Tier 1 Router\n ");
+				exit(0);
+			}
+		}
+
+		if (argc > 0) {  // Adding the interface and the edge node IP to the local lists.
+			opt = argv[0];
+			if (strcmp(opt, "-N") == 0) { // Checking whether the node is an edge node or an intermediate node.
+				argc--;
+				argv++;
+				//check if edge node - 0 is edge node? 
+				int edgeNode = atoi(argv[0]); //atoi converts string to integer.
+				int initB = 0;
+				argc--;
+				argv++;
+				if (edgeNode == 0) { //if 0 comes aftrer -N, we are having an edge node and we enter this block
+					endNode = 0; // only for edge node. endNode is updated to 0, if we are at edge node
+					int iterationNCount = 0;
+					printf("\nGetting IP..\n");
+					do {
+						char* nextN = argv[0]; //ipaddress is stored in the pointer
+						if (nextN[0] == '-') {
+							if (iterationNCount == 0) {
+								totalIPError++;
+							}
+							break;
+						}
+						
+						ipAddress[initB] = malloc(1 + strlen(nextN)); //allocate memory for the ipaddress[initB]
+						strcpy(ipAddress[initB], nextN); //copy the ipaddress of the ip node to ipaddress[initB]
+						argc--;
+						argv++;
+						char* nextN2 = argv[0]; //here the subnet mask is saved to the pointer 
+						if (nextN2[0] == '-') {
+							totalIPError++;
+							break;
+						}
+						cidrs[initB] = atoi(nextN2); //convert the subnet mask to integer and store in cidrs[initB]
+						argc--;
+						argv++;
+						char* nextN3 = argv[0]; //interface is saved in the pointer
+						if (nextN3[0] == '-') {
+							totalIPError++;
+							break;
+						}
+						
+						portName[initB] = malloc(1 + strlen(nextN3)); //allocate memory for portName[initB]
+						strcpy(portName[initB], nextN3); //copy the interface to portName[initB]
+						ipPortToSkip = malloc(1 + strlen(nextN3));
+						if (ipPortToSkip != NULL) {
+    						strcpy(ipPortToSkip, nextN3);            // Copy the string to the allocated memory
+						} else {
+    					// Handle memory allocation failure, if necessary
+    						printf("Memory allocation failed!\n");
+						}
+						printf("IP = %s\nSubnet Mask = %d\nPort Name = %s\n\n\n", ipAddress[initB], cidrs[initB], portName[initB]);
+						initB++;
+						endNWCount++;
+						argc--;
+						argv++;
+						iterationNCount++;
+					} while (argc > 0);
+				}
+				else {
+					//  skip till '-' encountered
+					while (argc > 0) {
+						char* skipNext = argv[0];
+						if (skipNext[0] == '-') {
+							break;
+						}
+						argc--;
+						argv++;
+					}
+				}
+			}
+			else {
+				printf(" \nError : Invalid Argument , value for -N not provided\n ");
+				exit(0);
+			}
+		}
+		if (argc > 0) {
+			printf("ERROR: Too many parameters \n");
+			exit(0);
+		}
+	}
+	else { //if argc <=0 then error
+		printf("ERROR: Not enough parameters \n");
+		exit(0);
+	}
+	finalARGCValue = argc;
+
+	// Converting IPV4  addresses from text to binary format for the edge nodes
+	//only tier 3 will be connected to ip node - Team KCT 12-22-2022
+	if (myTierValue == 3) {
+		int z = 0;
+		for (z = 0; z < endNWCount; z++) {
+			inet_pton(AF_INET, ipAddress[z], &ips[z]); //inet_pton convert ipaddress from text to binary. ips[z] will have the binary form of the ip address stored as text in ipaddress[z]
+			ips[z].s_addr = ntohl(ips[z].s_addr); //The ntohl() function converts the unsigned integer netlong from network byte order to host byte order.
+			ips[z].s_addr = ((ips[z].s_addr >> (32 - cidrs[z])) << (32 - cidrs[z])); //remove the last element from ipaddress. eg 10.10.5.2 will change to 10.10.5.0. we are finding the network address from the host address.
+			ips[z].s_addr = htonl(ips[z].s_addr); //The htonl() function converts the unsigned integer hostlong from host byte order to network byte order.
+		}
+		sprintf(ip_add, "%s", inet_ntoa(ips[0]));
+	}
+	if (myTierValue != 1) {
+		setInterfaces(); //gets list of interfaces except control interface to send null join message through - KCT 12-22-2022
+		getMyTierAddresses(tierAddr); //send null join message across all interfaces to get labels from parent - KCT 12-22-2022
+	}
+	struct addr_tuple* myAddr;
+	//Storing Tier Address, IP Address, Subnet Mask and Port in myAddr
+	if (endNode == 0) {
+		int index1, index2;
+		int numTemp = 0;
+		// if there are multiple IPS then do multiple end IPS * tier addresses entries here.
+		for (index1 = 0; index1 < myTotalTierAddress; index1++) {
+			for (index2 = 0; index2 < endNWCount; index2++) {
+				struct addr_tuple* myAddr = (struct addr_tuple*)malloc(sizeof(struct addr_tuple));
+				strcpy(myAddr->tier_addr, tierAddr[index1]);  // myaddr is a pointer that points to the first element in the array i.e. 
+
+				myAddr->ip_addr.s_addr = (unsigned long int) malloc(sizeof(unsigned long int));
+				memset(&myAddr->ip_addr.s_addr, '\0', sizeof(unsigned long int));
+				myAddr->ip_addr.s_addr = ips[index2].s_addr;  // NS is this correct? - memcopy?
+
+				char* temp11;
+				myAddr->cidr = (uint8_t)cidrs[index2];
+				strcpy(myAddr->etherPortName, portName[index2]);
+				
+				myAddr->if_index = -1; // Add code for port number
+				myAddr->isNew = true;
+				myAddr->next = NULL;
+				//comment add_entry_LL as mapping needs to be saved only on tier1 -- Samruddhi 1/24/2022
+				add_entry_LL(myAddr);
+			}
+		}
+		// Activating protocol to be ready
+		_get_MACTest(myAddr);
+	}
+	else {
+		// Activating protocol to be ready
+		_get_MACTest(NULL);
+	}
+	return 0;
+}
+
+/*******************************************************
+* freqCount(char[],char[])
+* method to find count of particular character
+* @param str (char[]) - string
+* @param search (char[]) - character to find occurrence
+* @return count (int) - occurrence count of a character
+********************************************************/
+int freqCount(char str[], char search) {
+
+	int i, count = 0;
+	for (i = 0; str[i] != '\0'; ++i) {
+		if (str[i] == search)
+			count++;
+	}
+	return count;
+}
+
+/********************************************************
+ * NS what are we advertising here 
+ * * put a print statement and check 
+***********************************************************/
+
+void checkEntriesToAdvertise() {
+	setInterfaces(); //interfaceList is being set by this function
+	int ifs = 1;
+	int port_number = 0;
+	// Whenever there is an update we have to advertise it to others.
+	for (; ifs < interfaceListSize; ifs++) {
+		uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET);
+		int mplrPayloadLen = 0;
+		mplrPayloadLen = buildPayload(mplrPayload, ONLY_NEW_ENTRIES, (int)if_nametoindex(interfaceList[ifs])); //NS - buildPayload defined in endNW.c
+		if (mplrPayloadLen) {
+			//printf("\nin checkEntriesToAdvertise");
+			// 1 is for same level neighbours
+			// 2 is for child interface
+			// 3 is for parent interface
+			port_number = matchPort(interfaceList[ifs]); // match port returns if connected to parent, child, neighbor
+			//printf("\n-----------%d",port_number);
+			if (port_number == 3) {
+				endNetworkSend(interfaceList[ifs], mplrPayload, mplrPayloadLen);
+			}
+		}
+		free(mplrPayload);
+	}
+	freeInterfaces();
+	interfaceListSize = 0;
+	clearEntryState(); // Mark new entries as old now. Defined in endNW.c
+}
+
+/****************************************************************
+checkEntriesToSync() NS to print and check 
+NS - difference between this and the previous one 
+Input : No Input
+Output : No return value
+This function SYNCs the IP to label map in tier 1 nodes
+****************************************************************/
+void checkEntriesToSync() {
+	setInterfaces(); //interfaceList is being set by this function
+	//printf("\nI am Syncing..\n");
+	// Whenever there is an update we have to advertise it to others.
+	int ifs = 1;
+	int port_number = 0;
+	for (; ifs < interfaceListSize; ifs++) {
+		// If new port we have to advertise our tierAdd<->IPAdd table.
+		uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET);
+		int mplrPayloadLen = 0;
+		//NS - buildPayload defined in endNW.c  
+		mplrPayloadLen = buildPayload(mplrPayload, ONLY_NEW_ENTRIES, (int)if_nametoindex(interfaceList[ifs]));
+		if (mplrPayloadLen) {
+			port_number = matchPort(interfaceList[ifs]);
+			//printf("-----------%d",port_number);
+			if (port_number == 1) {
+				//printf("\nin checkEntriesToSync");
+				endNetworkSend(interfaceList[ifs], mplrPayload, mplrPayloadLen);
+			}
+		}
+		free(mplrPayload);
+	}
+	freeInterfaces();
+	interfaceListSize = 0;
+	clearEntryState(); // Mark new entries as old now.
+}
+
+
+/***********************************************
+ * //Send NULL Join Request //called in helloList.h
+ * Null join will be sent by tier 2 and tier 3 nodes 
+ ***********************************************/
+void sendNullJoin(int to_port[20]) {
+	char labelAssignmentPayLoad[200];
+	setInterfaces();
+	int cplength = 0;
+	memset(labelAssignmentPayLoad, '\0', 200); // Clearing the payload
+	uint8_t tierValue = (uint8_t)myTierValue; // Setting the tierValue
+	memcpy(labelAssignmentPayLoad + cplength, &tierValue, 1);
+	//printf("\n Sending NULL join request to recovered interface, "
+	//	"interfaceListSize = %d payloadSize=%d", interfaceListSize, (int)strlen(labelAssignmentPayLoad));
+	
+	printf("\nSending NULL join request to recovered interface, interfaceListSize = %d", interfaceListSize);	
+	// Send NULL Join Message (Message Type, Tier Value) to all other nodes
+	//for (int i =1;i < interfaceListSize; i++) {
+		//printf("Interface List : %s",interfaceList[i]);
+	ctrlLabelSend(MESSAGE_TYPE_JOIN, to_port, labelAssignmentPayLoad);
+	//}
+	freeInterfaces();
+	interfaceListSize = 0;
+}
+
+
+/********************************************************** 
+*This function is used to populate the failed IP's to the variable "failedEndIPs_head". 
+*addr_tuple is being populated by the active interfaces.
+*******************************************************/
+void checkForLinkFailures(struct addr_tuple* myAddr, int numTierAddr) {
+	struct addr_tuple* current = failedEndIPs_head;
+	struct addr_tuple* previous = NULL;
+	while (current != NULL) { // Check if any failed End IPS became active.
+		if (isInterfaceActive(current->ip_addr, current->cidr)) {
+			struct addr_tuple* a = (struct addr_tuple*)calloc(1, sizeof(struct addr_tuple));
+			strcpy(a->tier_addr, current->tier_addr); // Add into the table as they are active.
+			a->if_index = -1; // insert info about index from which the packet has been received from.
+			a->isNew = true;
+			memcpy(&a->ip_addr, &current->ip_addr, sizeof(struct in_addr));
+			a->cidr = current->cidr;
+			add_entry_LL(a);
+			print_entries_LL();
+			struct addr_tuple* freeptr;
+			if (current == failedEndIPs_head) {
+				failedEndIPs_head = current->next;
+				previous = NULL;
+				freeptr = current;
+				current = NULL;
+			}
+			else {
+				previous->next = current->next;
+				freeptr = current;
+				current = current->next;
+			}
+			free(freeptr);
+			continue;
+		}
+		previous = current;
+		current = current->next;
+	}
+	int  i = 0;
+	for (; i < numTierAddr; i++) { // and check to see if address is already added to failed IP list or not.
+		struct addr_tuple* ptr = failedEndIPs_head;
+		bool isInFailedList = false;
+		while (ptr != NULL) {
+			if ((myAddr[i].ip_addr.s_addr == ptr->ip_addr.s_addr) && (strcmp(myAddr[i].tier_addr, ptr->tier_addr) == 0)) {
+				isInFailedList = true;
+				break;
+			}
+			ptr = ptr->next;
+		}
+		//printf("* %u *",myAddr[i].cidr); // if interface is not active, add to failed IP list.
+		if ((!isInFailedList) && (!isInterfaceActive(myAddr[i].ip_addr, myAddr[i].cidr))) {
+			struct addr_tuple* temp = (struct addr_tuple*)calloc(1, sizeof(struct addr_tuple));
+			memcpy(temp, &myAddr[i], sizeof(struct addr_tuple));
+			temp->isNew = true;
+			temp->next = NULL;
+			delete_entry_LL_IP(myAddr[i].ip_addr);
+			if (failedEndIPs_head == NULL) {
+				failedEndIPs_head = temp;
+				//printf("Will be removing this %s\n", inet_ntoa(failedEndIPs_head->ip_addr));
+			}
+			else {
+				temp->next = failedEndIPs_head;
+				failedEndIPs_head = temp;
+			}
+		}
+	}
+}
+
+/*******************************************************   
+ * Edge Nodes loosing labels 
+*****************************************************/
+void delete_failedEndIPs(uint8_t* tier_addr) {
+	if (failedEndIPs_head == NULL) {
+		printf("\n failedEndIPs_head is NULL\n");
+	}
+	else {
+		struct addr_tuple* current = failedEndIPs_head;
+		struct addr_tuple* prev = failedEndIPs_head;
+		while (current != NULL) {
+			if (strcmp(tier_addr, current->tier_addr) == 0) {
+				if (failedEndIPs_head == current) {
+					failedEndIPs_head = failedEndIPs_head->next;
+					free(current);
+					current = failedEndIPs_head;
+					continue;
+				}
+				else {
+					prev->next = current->next;
+					free(current);
+					current = prev;
+				}
+			}
+			prev = current;
+			current = current->next;
+		}
+	}
+}
+
+
+/**********************************************************
+This funtion is used to find all interfaces in a node and check whether interfaces are active
+**************************************************************/
+bool isInterfaceActive(struct in_addr ip, int cidr) {
+	struct ifaddrs* ifaddr, * ifa;
+	if (getifaddrs(&ifaddr)) { /* The getifaddrs() function creates a linked list of structures describing the network interfaces of the local system, and stores the address of the first item of the list in *ifap. */
+		perror("Error: getifaddrs() Failed\n");
+		if (enableLogScreen)
+			printf("\n Is Interface Active\n");
+		exit(0);
+	}
+	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr == NULL) {
+			continue;
+		}
+		int family;
+		family = ifa->ifa_addr->sa_family;
+		// populate interface names, if interface is UP and if ethernet interface doesn't belong to control interface and Loopback interface.
+		if (family == AF_INET && (strncmp(ifa->ifa_name, "lo", 2) != 0) && (ifa->ifa_flags & IFF_UP) != 0) {
+
+			struct sockaddr_in* ipaddr = ((struct sockaddr_in*)ifa->ifa_addr);
+			struct sockaddr_in* subnmask = ((struct sockaddr_in*)ifa->ifa_netmask);
+
+			if (ip.s_addr == (ipaddr->sin_addr.s_addr & subnmask->sin_addr.s_addr)) {
+				freeifaddrs(ifaddr);
+				return true;
+			}
+		}
+	}
+	freeifaddrs(ifaddr);
+	return false;
+}
+
+
+/*****************************************************************
+* getMyTierAddresses()
+* Method to obtain label for each node.
+* The label is received from nodes in the higher level by sending the JOIN requests.
+* The nodes at higher level will send a list of available labels which can be used by this node.
+* It will accept all the labels and sends the LABELS_ACCEPTED message back to the node from which
+* it recieved the labels.
+* @return status (void) - method returns none.
+***********************************************************************/
+void getMyTierAddresses(char* tierAddr[])
+{
+	//printf("\nEntering %s", __FUNCTION__);
+	printf("\n\n********************%s**********************", __FUNCTION__);
+	int sock; // Creating a socket here for auto addressing and related variables.
+	struct sockaddr_ll src_addr;
+	socklen_t addr_len = sizeof src_addr;
+	char buffer[2048];
+	unsigned char* ethhead = NULL;
+	int n;
+	char recvOnEtherPort[5];
+	if ((sock = socket(AF_PACKET, SOCK_RAW, htons(0x8850))) < 0) {  // Creating the EIBP CONTROL SOCKET HERE
+		printf("\nERROR: EIBP Socket ");
+	}
+	printf("\nCreated a socket for auto address label! ");
+	// Checking whether label is set or not.If not set, will wait here till the label is set
+	while (!recvdLabel)
+	{
+		int i = 0;
+		char labelAssignmentPayLoad[200]; // Form the NULL join message here
+		int cplength = 0;
+		memset(labelAssignmentPayLoad, '\0', 200);
+		uint8_t tierValue = (uint8_t)myTierValue; // Setting the tierValue
+		memcpy(labelAssignmentPayLoad + cplength, &tierValue, 1);
+		sleep(1);// Wait for 2 seconds NS ?? increased sleep time to reduce NULL join requests - WORSE
+		//printf("\n Sending NULL join request to all its interfaces, "
+		//	"interfaceListSize = %d  payloadSize=%d", interfaceListSize, (int)strlen(labelAssignmentPayLoad));
+		setInterfaces();
+		printf("\nSending NULL join request to all interfaces, interfaceListSize = %d CURRENT_TIME:%lf", interfaceListSize,getCurrentTime());
+		// NS - check what all interfaces the join request is sent. 
+		for (i = 1; i < interfaceListSize; i++) {
+			//Tejas Addition
+			if((myTierValue == 3 && strcmp(interfaceList[i],ipPortToSkip)==0) || strcmp(interfaceList[i],failedInterface)==0 ){
+						printf("\nInterface Name = %s", interfaceList[i]);
+						continue;
+				}
+			ctrlLabelSend(MESSAGE_TYPE_JOIN, interfaceList[i], labelAssignmentPayLoad);
+			printf("\nInterface Name = %s", interfaceList[i]);
+		}
+		printf("\nWaiting for MESSAGE_TYPE_LABELS_AVAILABLE message");
+		sleep(1);
+		n = recvfrom(sock, buffer, 2048, MSG_DONTWAIT,
+			(struct sockaddr*)&src_addr, &addr_len);
+		if (n == -1) {
+			printf("\nTimeout happened, NO MESSAGE_TYPE_LABELS_AVAILABLE\n");
+		}
+		else {
+			unsigned int tc = src_addr.sll_ifindex;
+			if_indextoname(tc, recvOnEtherPort);
+			//printf("\n Control message recvd from %s \n",recvOnEtherPort);
+			ethhead = (unsigned char*)buffer;
+			if (ethhead == NULL) {
+				printf("\nAutoLabel recieved message is empty \n");
+			}
+			else {
+				uint8_t checkMSGType = (ethhead[14]);
+				//   checkMSGType = (ethhead[15]);
+				//   printf("\n checkMSGType=%d \n",checkMSGType);
+				if (checkMSGType == MESSAGE_TYPE_LABELS_AVAILABLE) {
+					printf("\n\nReceived MESSAGE_TYPE_LABELS_AVAILABLE CURRENT_TIME:%lf",getCurrentTime());
+					int numberLabels = ethhead[15];
+					//printf("\n Number of Labels available = %d", numberLabels);
+					int i = 0;
+					struct labels* acceptedList;
+					int match_Port = matchPort(recvOnEtherPort);
+					if (match_Port == 0) { //to_parent port tag 
+						tagport(recvOnEtherPort, 3);
+					}
+					int messagePointer = 16; // Accepting each label here
+					for (; i < numberLabels; i++) {
+						int labelLength = ethhead[messagePointer];
+						//printf("\n Label Length = %d\n", labelLength);
+						messagePointer++;
+						char label[10];
+						memcpy(label, ethhead + messagePointer, labelLength);
+						//printf("\nLabel  = %s  Label length= %d\n", label, (int)strlen(label));
+						printf("\nLabel  = %s \n", label);
+						messagePointer = messagePointer + labelLength;
+						if (!recvdLabel) {
+							recvdLabel = true;
+							setTierInfo(label); //set the label here - For Default tier address */
+						}
+						insertTierAddr_updated(label,recvOnEtherPort); // pass it to tier address list
+						tierAddr[i] = malloc(1 + strlen(label));
+						strcpy(tierAddr[i], label);
+						// tierAddrCount++;
+						//printf("\nAdding the label to the list");
+						if (!acceptedList) { //creating a list of accepted labels
+							printf("\nAdding the first label to the list");
+							acceptedList = (struct labels*)malloc(sizeof(struct labels));
+							strncpy(acceptedList->label, label, strlen(label));
+							acceptedList->next = NULL;
+							notify_myLabels_Update(1, label);
+						}
+						else {
+							//printf("\nIn getMyTierAddress");
+							printf("\nAdding all other labels to the list: %s", label);
+							struct labels* newLabel = (struct labels*)malloc(sizeof(struct labels));
+							strncpy(newLabel->label, label, strlen(label));
+							newLabel->next = acceptedList;
+							acceptedList = newLabel;
+							notify_myLabels_Update(1, label);
+						}
+						checkEntriesToAdvertise();
+					}
+					cplength = 0; // Generate Labels Accepted Message
+					memset(labelAssignmentPayLoad, '\0', 200); 
+					uint8_t numLabels = (uint8_t)numberLabels; // Set the labels here .. TO be done - NS ???
+					memcpy(labelAssignmentPayLoad + cplength, &numLabels, 1);
+					cplength++;
+					struct labels* temp = acceptedList;
+					while (!temp) {  // Copy all other labels to the labels accepted message
+						char label[10];
+						memcpy(label, temp->label, strlen(temp->label));
+						uint8_t labelLength = strlen(label); // Set the labellength here
+						memcpy(labelAssignmentPayLoad + cplength, &numLabels, 1);
+						cplength++;
+						memcpy(labelAssignmentPayLoad + cplength, label, labelLength);
+						cplength = cplength + labelLength;
+					}
+					ctrlLabelSend(MESSAGE_TYPE_LABELS_ACCEPTED, recvOnEtherPort, labelAssignmentPayLoad); // Sending labels accepted message
+					printMyLabels();
+				}
+				// Add timeout for wait - NS ?? 
+				// Get the addresses
+				// Add it to the local table
+				// Send the LABELS accepted update to the node from which it got the message
+				// Break the loop,when you get labels from at-least two different nodes */
+			}
+		}
+	}
+	shutdown(sock, 2);
+	//printf("\n Exiting %s", __FUNCTION__);
+}
+
+/****************************************************
+* addLabelsList()
+* Add the passed label to the passed list
+* @return status (void) - method returns none.
+*****************************************************/
+void addLabelsList(struct labels* labelList, char label[]) {
+	printf("\n\n********************%s**********************", __FUNCTION__);
+	printf("\nLabel to be added : %s\n", label);
+	struct labels* newlabel = (struct labels*)malloc(sizeof(struct labels));
+	memcpy(newlabel->label, label, strlen(label));
+	newlabel->next = NULL;
+	printf("\n Created the label %p \n", labelList);
+	if (!labelList) {
+		printf("\n labellist is null now \n");
+		labelList = newlabel;
+	}
+	else {
+		struct labels* temp = labelList;
+		while (temp->next != NULL) {
+			temp = temp->next;
+		}
+		temp->next = newlabel;
+	}
+	printf("\nExit %s", __FUNCTION__);
+}
+
+/****************************************************************     
+ * 
+ * 
+*****************************************************************/
+void notify_lostmychild(char port[20]) {
+	if (myTierValue == 2) {
+		//printf("\nI am at tier 2 and lost my child\n");
+		struct labels* lostlabelList;
+		int numblostLabels = generateChildLabel(port, myTierValue + 1, &lostlabelList);
+		printf("\nI am at tier 2 Labels Lost  %d\n", numblostLabels);
+		// Generate the payload for sending this message. // Form the delete message here
+		char labelDeletePayLoad[200];
+		int cplength = 0;
+		memset(labelDeletePayLoad, '\0', 200);
+ 		// printf("\n %s : Creating the payload to send the lost labels %s\n", __FUNCTION__, lostlabelList->label);
+		uint8_t numberOfLabels = (uint8_t)numblostLabels; // Need to modify ??
+		memcpy(labelDeletePayLoad + cplength, &numberOfLabels, 1);
+		printf("\nlabelDeletePayLoad(string) = %x", *labelDeletePayLoad);// NS to fix ??
+		cplength++;
+		struct labels* temp = lostlabelList;
+		while (temp != NULL) {
+			//printf("\n label list is not null\n");
+			printf("\nCurrent label in the message = %s\n", temp->label);
+			uint8_t labelLength = (uint8_t)strlen(temp->label); // NS ??Need to modify
+			memcpy(labelDeletePayLoad + cplength, &labelLength, 1);
+			cplength++;
+			// Need to modify  NS ?? 
+			memcpy(labelDeletePayLoad + cplength, temp->label, labelLength);
+			cplength = cplength + labelLength;
+			temp = temp->next;
+			//printf("\n %s : GETTING THE NEXT LABEL \n", __FUNCTION__);
+			//printf("\n %s : GETTING THE NEXT LABEL \n", __FUNCTION__);
+		}
+		setInterfaces();
+		int port_number = 0;
+		//gettimeofday(&down_time, NULL);
+		//d_time = ((double)down_time.tv_sec*1000000 + (double)down_time.tv_usec) / 1000000;
+		printf("\nSending MESSAGE_TYPE_LABELS_LOST  to all the parent interfaces, "
+			"interfaceListSize = %d payloadSize=%d \n", interfaceListSize,
+			(int)strlen(labelDeletePayLoad));
+		printf("CURRENT_TIME:%lf\n",getCurrentTime());
+		int ifs = 1;
+		for (; ifs < interfaceListSize; ifs++) {
+			//Tejas addition
+			if(myTierValue == 3 && strcmp(interfaceList[ifs],ipPortToSkip)==0){
+						continue;
+				}
+			port_number = matchPort(interfaceList[ifs]);
+			if (port_number == 3) {
+				printf("\nInterface Name:%s\n",interfaceList[ifs]);
+				ctrlLabelSend(MESSAGE_TYPE_LABELS_LOST, interfaceList[ifs], labelDeletePayLoad);
+				//usleep(12);
+			}
+		}
+		freeInterfaces();
+		interfaceListSize = 0;
+	}
+}
+/****************************************************************     
+ * 
+ * 
+*****************************************************************/
+
+void notify_lostmylabels_direct_down(char failedPort[20]){
+	//tag = 1 : Neighbor port
+	//tag = 2 : to_child from parent port
+	//tag = 3 : to_parent from child port
+	int port = matchPort(failedPort);
+	switch(myTierValue){
+		case 1:
+			if(port==2){
+                printf("\nCase 1:\n");
+				notify_lostmylabels_tier1(failedPort);
+			}
+			break;
+		case 2:
+			if(port==2){
+                printf("\nCase 2:1:\n");
+				notify_lostmylabels_tier2(failedPort);
+			}else{
+                printf("\nCase 2:2:\n");
+				notify_lostmylabels_tier3(failedPort);
+			}
+			break;
+		case 3:
+            printf("\nCase 3:\n");
+			notify_lostmylabels_tier3(failedPort);
+			break;
+	}
+}
+
+void notify_lostmylabels_support(int labelCount, char* deletedLabels[],char failedPort[20]){
+	if (labelCount > 0) {
+		printf("\npreparing to send deleted Labels\n");
+        char labelDeletePayload[200];
+        memset(labelDeletePayload, '\0', sizeof(labelDeletePayload));
+
+        uint8_t numOfAddr = labelCount;
+        memcpy(labelDeletePayload, &numOfAddr, 1);
+
+        int payloadOffset = 1;
+        for (int i = 0; i < labelCount; i++) {
+			printf("label=%s\n",deletedLabels[i]);
+            uint8_t labelSize = strlen(deletedLabels[i]);
+            memcpy(labelDeletePayload + payloadOffset, &labelSize, 1);
+            payloadOffset += 1;
+            memcpy(labelDeletePayload + payloadOffset, deletedLabels[i], labelSize);
+            payloadOffset += labelSize;
+        }
+		
+        // Simulate sending the payload to interfaces
+
+        for (int i = 1; i < interfaceListSize; i++) {
+           // if ((myTierValue == 3 && strcmp(interfaceList[i], ipPortToSkip) == 0) ||
+           //     strcmp(interfaceList[i], failedPort) == 0) {
+			//		printf("\nskipped interfaceList[i]: %s\n",interfaceList[i]);
+           //     continue;
+           // }
+			if (myTierValue == 3){
+				if(strcmp(interfaceList[i], ipPortToSkip) == 0){
+					continue;
+				}
+			}
+			if(strcmp(interfaceList[i], failedPort) == 0){
+				continue;
+			}
+                
+			
+           int match_Port = matchPort(interfaceList[i]);
+		   if(match_Port==3){
+			//printf("\nmatch_Port here: %d\n",match_Port);
+            printf("\nSending MESSAGE_TYPE_MY_LABELS_DELETE message to - %s at CURRENT_TIME:%lf\n",
+                       interfaceList[i], getCurrentTime());
+            ctrlLabelSend(MESSAGE_TYPE_MY_LABELS_DELETE, interfaceList[i], labelDeletePayload);
+
+		   }
+            
+        }
+        interfaceListSize = 0;
+    }
+	for (int i = 0; i < labelCount; i++) {
+        for (int i = 0; i < labelCount; i++) {
+        if (deletedLabels[i] != NULL) {
+            free(deletedLabels[i]);
+            deletedLabels[i] = NULL; // Set to NULL after freeing to avoid double free
+        }
+    }
+    }
+    freeInterfaces();
+}
+
+
+
+void notify_lostmylabels_tier2(char failedPort[20]) {
+    if (headInterfaceLabel == NULL) {
+        return; // No entries to delete, return early
+    }
+
+    int labelCount = 0;
+    char *deletedLabels[100]; // To store labels for deletion
+
+    // Step 1: Collect labels from the failed port in childInterfaceToLabelList
+    struct childInterfaceToLabelList *current = headInterfaceLabel;
+    while (current != NULL) {
+        if (strcmp(current->interface, failedPort) == 0) {
+            struct labels *labelNode = current->labelList;
+            while (labelNode != NULL) {
+                if (labelCount < 100) { // Prevent exceeding the array size
+                    deletedLabels[labelCount] = malloc(strlen(labelNode->label) + 1);
+                    strcpy(deletedLabels[labelCount++], labelNode->label);
+                }
+                labelNode = labelNode->next;
+            }
+            break; // Found the interface, no need to iterate further
+        }
+        current = current->next;
+    }
+
+    // Step 2: Delete the labels from childInterfaceToLabelList
+    deleteLabelsByInterface(failedPort);
+
+   
+	if(labelCount > 0 )
+	{
+		char *portNumber = failedPort + 3;
+		if(delete_neighbour_by_failedPort(portNumber)){
+			//printf("\nNeighbour Table after removing the addresses of the unreachable node CURRENT_TIME:%lf", getCurrentTime());
+            printNeighbourTable(true);
+            printMyLabels();
+		}
+	}
+
+    // Step 4: Notify and cleanup
+    notify_lostmylabels_support(labelCount, deletedLabels, failedPort);
+
+    // Free memory allocated for deletedLabels
+    for (int i = 0; i < labelCount; i++) {
+        free(deletedLabels[i]);
+    }
+}
+
+
+
+
+void notify_lostmylabels_tier3(char failedPort[20]) {
+    struct nodeTL *current = headTL;
+    struct nodeTL *prev = NULL;
+	struct nodeHL *currentNeighbor = headHL;
+    struct nodeHL *prevNeighbor = NULL;
+	char recvOnEtherPort[5];
+	//printf("\nThe Interface is lost at %s\n",failedPort);
+    if (headTL == NULL) {
+        return; // No entries to delete, return early
+    }
+
+    size_t failedPortLength = strlen(failedPort);
+    int labelCount = 0;
+    char *deletedLabels[100]; // Assume a reasonable max number of labels for simplicity
+
+    //printf("\nThe Interface is lost at %s\n", failedPort);
+
+    // Delete matching nodes and collect labels in one loop
+    while (current != NULL) {
+        if (strlen(current->port) == failedPortLength &&
+            strncmp(current->port, failedPort, failedPortLength) == 0) {
+            // Collect the label
+            if (labelCount < 100) { // Prevent exceeding the array size
+				//printf("\nlabel count %d\n",labelCount);
+                //deletedLabels[labelCount++] = current->tier;
+				deletedLabels[labelCount] = malloc(strlen(current->tier) + 1);
+				strcpy(deletedLabels[labelCount++], current->tier);
+            }
+
+            // Print the deleted label
+            printf("\nDeleting label from My Label Table: %s\n", current->tier);
+
+            // Remove the current node
+            if (current == headTL) {
+                headTL = current->next;
+                free(current);
+                current = headTL;
+            } else {
+                prev->next = current->next;
+                free(current);
+                current = prev->next;
+            }
+        } else {
+            prev = current;
+            current = current->next;
+        }
+    }
+	char** labelsDeleted;
+	int countDeleted;
+	if(delete_entry_LL_Addr_updated(deletedLabels,labelCount,recvOnEtherPort, myTierValue,  &labelsDeleted, &countDeleted)){
+		add_failed_entry_LL_updated(deletedLabels, labelCount);
+	}
+
+	if (headHL == NULL) {
+        return; // No entries to delete, return early
+    }
+
+	while(currentNeighbor != NULL) {
+		if(strlen(currentNeighbor->port) == failedPortLength &&
+			strncmp(currentNeighbor->port, failedPort, failedPortLength) == 0) 
+			{
+				printf("\nDeleting label from My Neighbor Table: %s\n", currentNeighbor->tier);
+				if(currentNeighbor == headHL)
+				{
+					headHL = currentNeighbor->next;
+					free(currentNeighbor);
+					currentNeighbor = headHL;
+				} else {
+					prevNeighbor->next = currentNeighbor->next;
+					free(currentNeighbor);
+					currentNeighbor = prevNeighbor->next;
+				}
+
+
+			} else {
+				prevNeighbor = currentNeighbor;
+				currentNeighbor = currentNeighbor->next;
+			}
+		}
+
+		if (myTierValue == 2) {
+			char *failedAddrs[labelCount];  // Array to store derived labels
+			int failedCount = 0;  // Counter for failed labels
+
+			for (int i = 0; i < labelCount; i++) {
+				char myLabelCopy[20];
+				strcpy(myLabelCopy, deletedLabels[i]);
+
+				char *tokens[3]; // Since we know it always has 3 parts
+				int count = 0;
+
+				// Tokenize using '.'
+				char *saveptr;
+				char *token = strtok_r(myLabelCopy, ".", &saveptr);
+				while (token && count < 3) {
+					tokens[count++] = token;
+					token = strtok_r(NULL, ".", &saveptr);
+				}
+
+				if (count == 3) { // Ensure there are exactly 3 parts
+					char middleSegment[10]; // Store last two parts
+					snprintf(middleSegment, sizeof(middleSegment), "%s.%s", tokens[1], tokens[2]);
+
+					// Get ALL derived labels instead of just one
+					getDerivedLabelsFromNeighbourTable(middleSegment, failedAddrs, &failedCount);
+				}
+			}
+
+			if (failedCount > 0) {
+				// Call delete_neighbour function
+				bool deleted = delete_neighbour(failedAddrs, failedCount, recvOnEtherPort);
+
+				// Free dynamically allocated memory
+				for (int i = 0; i < failedCount; i++) {
+					free(failedAddrs[i]);
+				}
+			} else {
+				printf("No derived labels found for deletion.\n");
+			}
+		}
+
+
+		//printf("\nNeighbour Table after removing the addresses of the unreachable node CURRENT_TIME:%lf",getCurrentTime());
+		printNeighbourTable(true);
+		printMyLabels();
+		print_entries_LL();
+    	notify_lostmylabels_support(labelCount,deletedLabels,failedPort);
+	for (int i = 0; i < labelCount; i++) {
+        free(deletedLabels[i]);
+    }
+}
+
+
+void notify_lostmylabels_tier1(char failedPort[20]) {
+	
+    if (failedPort == NULL) {
+        return;
+    }
+	if (headInterfaceLabel == NULL) {
+        return; // No entries to delete, return early
+    }
+	int labelCount = 0;
+    char *deletedLabels[100]; // To store labels for deletion
+	struct childInterfaceToLabelList *current = headInterfaceLabel;
+    while (current != NULL) {
+        if (strcmp(current->interface, failedPort) == 0) {
+            struct labels *labelNode = current->labelList;
+            while (labelNode != NULL) {
+                if (labelCount < 100) { // Prevent exceeding the array size
+                    deletedLabels[labelCount] = malloc(strlen(labelNode->label) + 1);
+                    strcpy(deletedLabels[labelCount++], labelNode->label);
+                }
+                labelNode = labelNode->next;
+            }
+            break; // Found the interface, no need to iterate further
+        }
+        current = current->next;
+    }
+	deleteLabelsByInterface(failedPort);
+	char **allCollectedLabels = NULL;
+    int totalCollectedCount = 0;
+	char *portNumber = failedPort + 3;
+	int totalDeletedCount = 0;
+	delete_neighbour_by_failedPort(portNumber);
+	deleteLabelsAndCheckGrandparents(deletedLabels, labelCount, &totalDeletedCount);
+	/*
+	if (collect_neighbours_by_failedPort(portNumber, &allCollectedLabels, &totalCollectedCount)) {
+        printf("Collected %d labels\n", totalCollectedCount);
+
+        // Now call the deleteLabelsAndCheckGrandparents function with the collected labels
+        deleteLabelsAndCheckGrandparents(allCollectedLabels, totalCollectedCount, &totalDeletedCount);
+
+        // Free allocated memory for collected labels
+        for (int i = 0; i < totalCollectedCount; i++) {
+            free(allCollectedLabels[i]);
+        }
+        free(allCollectedLabels);
+    }*/
+	
+    printNeighbourTable((labelCount>0) ? 1:0);
+    printMyLabels();
+	// Step 4: Notify and cleanup
+    //notify_lostmylabels_support(labelCount, deletedLabels, failedPort);
+	publishIPLabelMap_updated(deletedLabels, labelCount, 1, failedPort,true);
+    // Free memory allocated for deletedLabels
+    for (int i = 0; i < labelCount; i++) {
+        free(deletedLabels[i]);
+    }
+}
+
+/****************************************************************
+ * notify_lostmyparent()
+ * Called when a parent port (match_port==3) fails on a tier-2 node.
+ * Steps:
+ *   1. Collect and remove own labels on the failed parent port from headTL.
+ *   2. Remove parent neighbor entries on the failed port from headHL.
+ *   3. For each lost own label, find and delete child-derived labels from headHL.
+ *   4. Collect all lost labels (own + child-derived) and send
+ *      MESSAGE_TYPE_LABELS_LOST to remaining parent interfaces.
+ *****************************************************************/
+void notify_lostmyparent(char failedPort[20]) {
+
+    // Step 1: Collect own labels from headTL where port == failedPort, then remove them
+    int ownLabelCount = 0;
+    char *ownLostLabels[100];
+    struct nodeTL *tlCurrent = headTL, *tlPrev = NULL;
+    while (tlCurrent != NULL) {
+        if (strcmp(tlCurrent->port, failedPort) == 0) {
+            if (ownLabelCount < 100) {
+                ownLostLabels[ownLabelCount] = malloc(strlen(tlCurrent->tier) + 1);
+                strcpy(ownLostLabels[ownLabelCount++], tlCurrent->tier);
+            }
+            printf("\nRemoving own label %s from headTL (port %s)\n", tlCurrent->tier, failedPort);
+            if (tlCurrent == headTL) {
+                headTL = tlCurrent->next;
+                free(tlCurrent);
+                tlCurrent = headTL;
+            } else {
+                tlPrev->next = tlCurrent->next;
+                free(tlCurrent);
+                tlCurrent = tlPrev->next;
+            }
+        } else {
+            tlPrev = tlCurrent;
+            tlCurrent = tlCurrent->next;
+        }
+    }
+    printf("\nnotify_lostmyparent: %d own labels lost on port %s\n",
+           ownLabelCount, failedPort);
+
+    // Step 2: Remove neighbor entries on the failed parent port from headHL
+    struct nodeHL *hlCurrent = headHL, *hlPrev = NULL;
+    while (hlCurrent != NULL) {
+        if (strcmp(hlCurrent->port, failedPort) == 0) {
+            printf("Removing neighbor %s from headHL (port %s)\n", hlCurrent->tier, failedPort);
+            if (hlCurrent == headHL) {
+                headHL = hlCurrent->next;
+                free(hlCurrent);
+                hlCurrent = headHL;
+            } else {
+                hlPrev->next = hlCurrent->next;
+                free(hlCurrent);
+                hlCurrent = hlPrev->next;
+            }
+        } else {
+            hlPrev = hlCurrent;
+            hlCurrent = hlCurrent->next;
+        }
+    }
+
+    // Step 3: Find child labels derived from each lost own label, then remove from headHL
+    int childLostCount = 0;
+    char *childLostLabels[100];
+    for (int i = 0; i < ownLabelCount; i++) {
+        char myLabelCopy[50];
+        strncpy(myLabelCopy, ownLostLabels[i], sizeof(myLabelCopy) - 1);
+        myLabelCopy[sizeof(myLabelCopy) - 1] = '\0';
+
+        char *tokens[4];
+        int count = 0;
+        char *saveptr;
+        char *token = strtok_r(myLabelCopy, ".", &saveptr);
+        while (token && count < 4) {
+            tokens[count++] = token;
+            token = strtok_r(NULL, ".", &saveptr);
+        }
+
+        // Own label has form "tier.X.Y" (3 tokens) → derived child labels share middle "X.Y"
+        if (count == 3) {
+            char middleSegment[20];
+            snprintf(middleSegment, sizeof(middleSegment), "%s.%s", tokens[1], tokens[2]);
+            getDerivedLabelsFromNeighbourTable(middleSegment, childLostLabels, &childLostCount);
+        }
+    }
+
+    // Delete child-derived labels from headHL
+    if (childLostCount > 0) {
+        char dummyPort[5] = "";
+        delete_neighbour(childLostLabels, childLostCount, dummyPort);
+    }
+
+    // Step 3b: Delete own lost labels from the IP-to-label map (tablehead / entries_LL).
+    // Pass myTier=3 to suppress the internal publishIPLabelMap_updated inside
+    // delete_entry_LL_Addr_updated — we send the full label set below.
+    if (ownLabelCount > 0) {
+        char **deletedFromLL;
+        int deletedFromLLCount = 0;
+        char recvPort[5] = "";
+        delete_entry_LL_Addr_updated(ownLostLabels, ownLabelCount, recvPort, 3,
+                                     &deletedFromLL, &deletedFromLLCount);
+        if (deletedFromLLCount > 0) {
+            print_entries_LL();
+            for (int i = 0; i < deletedFromLLCount; i++) free(deletedFromLL[i]);
+        }
+        if (deletedFromLL) free(deletedFromLL);
+    }
+
+    // Step 4: Build combined lost-labels array, filter already-processed labels,
+    // then send MESSAGE_TYPE_LABELS_LOST to remaining parent ports.
+    int totalLostCount = ownLabelCount + childLostCount;
+    if (totalLostCount == 0) {
+        printf("notify_lostmyparent: no labels to report for port %s\n", failedPort);
+        printNeighbourTable(true);
+        printMyLabels();
+        return;
+    }
+
+    char *allLostLabels[totalLostCount];
+    for (int i = 0; i < ownLabelCount; i++)
+        allLostLabels[i] = ownLostLabels[i];
+    for (int i = 0; i < childLostCount; i++)
+        allLostLabels[ownLabelCount + i] = childLostLabels[i];
+
+    // Filter out labels already marked as processed to avoid duplicate LABELS_LOST sends
+    char *newLabels[totalLostCount];
+    int newLabelCount = 0;
+    for (int i = 0; i < totalLostCount; i++) {
+        if (!is_label_processed(allLostLabels[i])) {
+            newLabels[newLabelCount++] = allLostLabels[i];
+            add_processed_label(allLostLabels[i]);
+        }
+    }
+
+    if (newLabelCount == 0) {
+        printf("notify_lostmyparent: all labels already processed, not sending LABELS_LOST\n");
+        printNeighbourTable(true);
+        printMyLabels();
+        for (int i = 0; i < ownLabelCount; i++) free(ownLostLabels[i]);
+        for (int i = 0; i < childLostCount; i++) free(childLostLabels[i]);
+        return;
+    }
+
+    // Build payload: [numLabels][len][label]...
+    char labelLostPayload[200];
+    memset(labelLostPayload, '\0', sizeof(labelLostPayload));
+    uint8_t numLabels = (uint8_t)newLabelCount;
+    memcpy(labelLostPayload, &numLabels, 1);
+    int payloadOffset = 1;
+    for (int i = 0; i < newLabelCount; i++) {
+        uint8_t labelSize = (uint8_t)strlen(newLabels[i]);
+        memcpy(labelLostPayload + payloadOffset, &labelSize, 1);
+        payloadOffset += 1;
+        memcpy(labelLostPayload + payloadOffset, newLabels[i], labelSize);
+        payloadOffset += labelSize;
+    }
+
+    printf("\nSending MESSAGE_TYPE_LABELS_LOST with %d labels (own=%d child=%d)\n",
+           newLabelCount, ownLabelCount, childLostCount);
+
+    setInterfaces();
+    for (int i = 1; i < interfaceListSize; i++) {
+        if (strcmp(interfaceList[i], failedPort) == 0) continue;
+        if (myTierValue == 3 && strcmp(interfaceList[i], ipPortToSkip) == 0) continue;
+        if (matchPort(interfaceList[i]) == 3) {
+            printf("\nSending MESSAGE_TYPE_LABELS_LOST to parent on %s at CURRENT_TIME:%lf\n",
+                   interfaceList[i], getCurrentTime());
+            ctrlLabelSend(MESSAGE_TYPE_LABELS_LOST, interfaceList[i], labelLostPayload);
+        }
+    }
+    interfaceListSize = 0;
+
+    printNeighbourTable(true);
+    printMyLabels();
+
+    for (int i = 0; i < ownLabelCount; i++) free(ownLostLabels[i]);
+    for (int i = 0; i < childLostCount; i++) free(childLostLabels[i]);
+}
+
+/***************************************************************
+* generateChildLabel()
+* Generate the child labels with respect to all available labels for the current node.
+* Joins the Tier Value of the child , UID of each parent label and the interface to which the parent is connected.
+* @return status (int) - method return the number of labels created.
+*****************************************************************/
+
+int generateChildLabel(char* myEtherPort, int childTier, struct labels** labelList) {
+	printf("\n\n********************%s**********************", __FUNCTION__);
+	// printf("\n\nIn %s", __FUNCTION__);
+	//printf("\n Child port = %s", myEtherPort);
+	int match_Port = matchPort(myEtherPort);
+	if (match_Port == 0) {
+		tagport(myEtherPort, 2); //tag = 2 : to_child port
+	}
+	// Get each tier address and create the child labels
+	char* myTierAddress = getTierInfo();
+	int countNewLabels = 0;
+	//printf("\n My TierAddress = %s", myTierAddress);
+	char childLabel[10];
+	memset(childLabel, '\0', 10);
+	sprintf(childLabel, "%d", childTier);
+	struct nodeTL* temp = headTL;
+	*labelList = NULL;
+	// printf("\n Going through each of my tier addresses , primary address = %s\n", temp->tier);
+	while (temp) {
+		countNewLabels++;
+		printf("\nMy TierAddress = %s \n", temp->tier);
+		memset(childLabel, '\0', 10);
+		sprintf(childLabel, "%d", childTier);
+		joinChildTierParentUIDInterface(childLabel, temp->tier, myEtherPort);
+		struct labels* newLabel = (struct labels*)malloc(sizeof(struct labels));
+		//printf("\n childLabel = %s  strlen(childLabel)=%d", childLabel, (int)strlen(childLabel));
+		memcpy(newLabel->label, childLabel, strlen(childLabel) + 1);
+		//printf("\n newLabel->label = %s  strlen(newLabel->label)=%d", childLabel, (int)strlen(newLabel->label));
+		newLabel->next = *labelList;
+		*labelList = newLabel;
+		printf("\nCreated the new child label = %s\n", newLabel->label);
+		temp = temp->next;
+	}
+	//printf("\n Exit: %s , Number of labels generated = %d \n", __FUNCTION__, countNewLabels);
+	//printf("\n Exit: %s , Number of labels generated = %d  labelList= %s\n",__FUNCTION__,countNewLabels,(*labelList)->label); NS commented on 4-14.20
+	return countNewLabels;
+}
+
+
+/********************************************************************
+* notify_myLabels_Update()
+* method to let other node know that I have a label added or deleted.
+* @return status (void) - method return none
+*********************************************************************/
+void notify_myLabels_Update(int update_action, char inTier[20]) {
+	//printf("\n NewLabel Updated: %s", inTier);
+	char ctrlPayLoadC[200];
+	memset(ctrlPayLoadC, '\0', 200);
+	uint8_t numOfAddr = 1; //**1 samruddhi check
+	memcpy(ctrlPayLoadC, &numOfAddr, 1); // NS - memory of numAddr stored in ctrlPayLoadC
+	int cpLength = 1;
+	char tempAddrA[20];
+	memset(tempAddrA, '\0', 20);
+	strcpy(tempAddrA, inTier); //copy the  tier address to tempAddrA
+	uint8_t localTierSizeA = strlen(tempAddrA);
+	//printf("TEST:(helloM_List) ctrl packet - localTierSizeA: %u  \n", localTierSizeA);
+	memcpy(ctrlPayLoadC + cpLength, &localTierSizeA, 1); // copying the tier address size
+	cpLength = cpLength + 1;
+	memcpy(ctrlPayLoadC + cpLength, tempAddrA, localTierSizeA); // copying the tier address
+	cpLength = cpLength + localTierSizeA;
+	// Send should initiate before receive  - NS ??
+	setInterfaces(); //interfaceList is being set by this function
+	if (update_action == 1) {
+		int loopCounter1 = 1;
+		//this for loop sends the control message as well as keeps track of the no of control messages sent
+		for (; loopCounter1 < interfaceListSize; loopCounter1++) {
+			//Tejas addition
+			if((myTierValue == 3 && strcmp(interfaceList[loopCounter1],ipPortToSkip)==0) || strcmp(interfaceList[loopCounter1],failedInterface)==0){
+						continue;
+			}
+			ctrlLabelSend(MESSAGE_TYPE_MY_LABELS_ADD, interfaceList[loopCounter1], ctrlPayLoadC); //ctrlSend method is used to send Ethernet frame
+			//MPLRCtrlSendCount++; //keeps track of the no of control messages sent
+			printf("\n\n*************In notify_myLabels_Update******************");
+			printf("\nSending MESSAGE_TYPE_MY_LABELS_ADD message to - %s CURRENT_TIME:%lf", interfaceList[loopCounter1],getCurrentTime());
+		}
+	}
+	else {
+		int loopCounter1 = 1;
+		//send to a limited set of interfaces - NS
+		//gettimeofday(&down_time, NULL);
+		//d_time = ((double)down_time.tv_sec*1000000 + (double)down_time.tv_usec) / 1000000;
+		printf("\nCURRENT_TIME:%lf\n", getCurrentTime());
+		for (; loopCounter1 < interfaceListSize; loopCounter1++) {
+			//MPLRCtrlSendCount++; //keeps track of the no of control messages sent
+			//printf("\nDELETE MESSAGE RECEIVED -LABELS LOST: CURRENT_TIME:%ld.%ld \n", current_time.tv_sec, current_time.tv_usec);
+			//gettimeofday(&down_time, NULL);
+			//d_time = ((double)down_time.tv_sec*1000000 + (double)down_time.tv_usec) / 1000000;
+			//Tejas addition
+			if((myTierValue == 3 && strcmp(interfaceList[loopCounter1],ipPortToSkip)==0) || strcmp(interfaceList[loopCounter1],failedInterface)==0){
+						continue;
+			}
+			//Tejas Subtraction
+			//printf("\nSending MESSAGE_TYPE_MY_LABELS_DELETE message to - %s at CURRENT_TIME: %lf\n ", interfaceList[loopCounter1], getCurrentTime() );
+			//ctrlLabelSend(MESSAGE_TYPE_MY_LABELS_DELETE, interfaceList[loopCounter1], ctrlPayLoadC); //ctrlSend method is used to send Ethernet frame
+		}
+	}
+	freeInterfaces();
+	interfaceListSize = 0;
+}
+
+/******************************************************************
+* requestIPresolve()
+* method to request tier1 node for IP resolve.
+* @return status (void) - method return none
+********************************************************************/
+void requestIPresolve(char destinationInterfaceIPAddr[], char Mytier[]) {
+	printf("\ndestinationInterfaceIPAddr : %s\n", destinationInterfaceIPAddr);
+	char ctrlPayLoadC[200];
+	memset(ctrlPayLoadC, '\0', 200);
+	uint8_t numOfAddr = 1;//**1 samruddhi check
+	memcpy(ctrlPayLoadC, &numOfAddr, 1); // NS - memory of numAddr stored in ctrlPayLoadC
+	int cpLength = 1;
+	char tempMyAddr[20]; //For MyTier -- 02/07/2022 - NS ??
+	memset(tempMyAddr, '\0', 20);
+	strcpy(tempMyAddr, Mytier); //copy mytier to temp
+	uint8_t localTierSize = strlen(tempMyAddr);
+	memcpy(ctrlPayLoadC + cpLength, &localTierSize, 1); // copying the tier address size
+	cpLength = cpLength + 1;
+	memcpy(ctrlPayLoadC + cpLength, tempMyAddr, localTierSize); // copying the tier address
+	cpLength = cpLength + localTierSize;
+	
+	char tempAddrA[20];
+	memset(tempAddrA, '\0', 20);
+	strcpy(tempAddrA, destinationInterfaceIPAddr); //copy the t th tier address to tempAddrA
+	uint8_t localTierSizeA = strlen(tempAddrA);
+	//printf("TEST:(helloM_List) ctrl packet - localTierSizeA: %u  \n", localTierSizeA);
+	memcpy(ctrlPayLoadC + cpLength, &localTierSizeA, 1); // copying the tier address size
+	cpLength = cpLength + 1;
+	memcpy(ctrlPayLoadC + cpLength, tempAddrA, localTierSizeA); // copying the tier address
+	cpLength = cpLength + localTierSizeA;
+	//  printf("PayLoad --- %s",ctrlPayLoadC); 
+	// NS- must print this and check // ctrlPayLoadC can store only 200 char- could have been variable 
+	// SM - Check the SOH and BEL issues in the log 
+	//printf("\nctrlPayLoadC : %s", ctrlPayLoadC);
+	setInterfaces(); 
+
+	//NS - check who gets this message 
+	char parentTierAdd[20];
+	memset(parentTierAdd, '\0', 20);
+	findParntLongst(tierAddress, parentTierAdd);
+	struct nodeHL* fNode = headHL;
+	char eth_addr[20];
+	if (fNode == NULL) {
+		if (enableLogScreen) {
+			printf("\nERROR: Neighbor List is empty \n");
+		}
+	}
+	
+	while (fNode != NULL) { // traverse the list
+		//while (fNode->next != NULL) {
+		if ((strlen(fNode->tier) == strlen(parentTierAdd))
+			&& ((strncmp(fNode->tier, parentTierAdd, strlen(parentTierAdd)) == 0))) {
+			strcpy(eth_addr, fNode->port);
+			break;
+		}
+		else {
+			fNode = fNode->next;
+		}
+	}
+	ctrlLabelSend(MESSAGE_TYPE_REQUEST_IP_RESOLVE, eth_addr, ctrlPayLoadC); //ctrlSend method is used to send Ethernet frame
+	//MPLRCtrlSendCount++; //keeps track of the no of control messages sent
+	printf("\nSending MESSAGE_TYPE_REQUEST_IP_RESOLVE message to - %s ", eth_addr);
+	freeInterfaces();
+	interfaceListSize = 0;
+
+}
+
+/*********************************************************************
+* responseIPresolve()
+* method to response tier3 node as a result of request IP resolve.
+*	params : resolved label, resolved ip, return to which label.
+* @return status (void) - method return none
+**********************************************************************/
+void responseIPresolve(char tieraddr[], struct in_addr ip_addr, char DestTierLabel[], uint8_t entries, int isnew) {
+	uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET);
+	int mplrPayloadLen = 0; // buildPayload defined in endNW.c  
+	// printf("\nSending buildIPResolvePacket : %s", tieraddr);
+	int tierValue = 0;
+	if (myTierValue == 1) {
+		tierValue = 1;
+	}// can be optimized -- to do Samruddhi 4/15/2022
+	if (isnew == 1) {
+		mplrPayloadLen = buildIPResolvePacket(mplrPayload, DestTierLabel, tierValue);
+	}
+	setInterfaces(); //interfaceList is being set by this function
+	int ifs = 1;
+	int port_number = 0;
+	//printf("buildIPResolvePacket out::\n");		
+	if (mplrPayloadLen) {
+		//printf("I have mplrPayloadLen %s\n",mplrPayload);
+		char parentofDest[20];
+		memset(parentofDest, '\0', 20);
+		char eth_addr1[20];
+		//printf("\nI am here  %s\n", DestTierLabel);		
+		findParentLongest(DestTierLabel, parentofDest);
+		//printf("\nParent : %s\n", parentofDest);
+		struct nodeHL* fNode1 = headHL;
+		if (fNode1 == NULL) {
+			if (enableLogScreen) {
+				printf("\nERROR: Neighbor List is empty \n");
+			}
+		}
+		while (fNode1 != NULL) { // traverse the list
+			//while (fNode->next != NULL) {
+			if ((strlen(fNode1->tier) == strlen(parentofDest)) && ((strncmp(fNode1->tier, parentofDest, strlen(parentofDest)) == 0))) {
+				strcpy(eth_addr1, fNode1->port);
+				printf("\nForwarding resolve response to : %s on %s", fNode1->tier, eth_addr1);
+				endNetworkSend(eth_addr1, mplrPayload, mplrPayloadLen);
+				return;
+			}
+			fNode1 = fNode1->next;
+		}
+		free(mplrPayload);
+	}
+	freeInterfaces();
+	interfaceListSize = 0;
+	return;
+}
+
+/********************************************************************
+ * 
+ *************************************************************************/
+/*
+void deleteIPLabel(char *newLabel, char recvOnEtherPort[5]) {
+   // bool foundChild = false;
+
+    if (myTierValue == 1) {
+        struct addr_tuple* current = tablehead;
+        char* tierAddr = newLabel;
+		printf("\n Tier Address Length %d \n", tierAddr);
+        while (current != NULL) {
+			if(strlen(tierAddr)!=7)
+			{
+                printf("\nChild %s\n", tierAddr);
+            if (checkIfGrandParent(current->tier_addr, tierAddr)) {
+                
+                printf("Found grandchild %s\n", current->tier_addr);
+                modify_LL_updated(current->tier_addr, 1, recvOnEtherPort, 1);
+				
+               // foundChild = true;
+                
+				
+            }
+			}
+            current = current->next;
+        }
+		
+    }
+	
+	//printf("\nFound Child %d\n",foundChild);
+    
+}
+
+*/
+/*
+void deleteIPLabel(char failedEth[],char recvOnEtherPort[5]) {
+	if (myTierValue == 1) {
+		//Samruddhi - need to generalize this. newaddress[3] is defined to save tier 1's grandchild sublabel.
+		//if eth3 from 1.1 is down I need to delete IP addresses with substr as 1.3
+		struct addr_tuple* current = tablehead;
+		char* myTierAddress = getTierInfo();
+		char newaddress[10] = ".";
+		strcpy(newaddress, "2.");
+		strcat(newaddress, myTierAddress + 2);
+		strcat(newaddress, ".");
+		strcat(newaddress, failedEth + 3);
+		printf("\n newaddress = %s\n", newaddress);
+		while (current != NULL) {
+			if (checkIfGrandParent(current->tier_addr, newaddress)) {
+				printf("Found grand child %s\n", current->tier_addr);
+				modify_LL_updated(current->tier_addr,1,recvOnEtherPort,1);
+				//delete_entry_LL_Addr_updated(current->tier_addr,recvOnEtherPort);
+			}
+			current = current->next;
+		}
+       
+	}
+}
+*/
+// Tejas addition - Rewritten deleteIPLabel (Fix 6)
+// Fix 6: Include tier 2 label (newaddress) in delete message along with grandchild labels.
+//        Pass myTier=3 to modify_LL_updated to suppress auto-send, build combined array,
+//        and call publishIPLabelMap_updated directly.
+//        Do NOT call delete_neighbour_by_failedPort() here — the outer delete() loop in
+//        helloList.h already removes all neighbor entries on the failed port. Calling it
+//        here frees nodes the outer loop still references, causing use-after-free segfault.
+//        Grandchildren of OTHER D-node labels on the same port (e.g., 3.3.3.4 from 2.3.3)
+//        are NOT removed — those routes are still reachable through other C-nodes.
+// Problem solved: (1) Original code only sent grandchild labels (tier 3) without the
+//        tier 2 label, so peer C-nodes couldn't distinguish A-node vs D-node failure.
+//        (2) delete_neighbour_by_failedPort inside deleteIPLabel caused segfault because
+//        the outer delete() loop in helloList.h was still iterating headHL.
+void deleteIPLabel(char failedEth[], char recvOnEtherPort[5]) {
+
+    if (myTierValue == 1) {
+
+        struct addr_tuple* current;
+        char* myTierAddress = getTierInfo();
+
+        // Tejas addition - compute primary tier 2 label assigned by this C-node to D-node on failedEth
+        char newaddress[10];
+        snprintf(newaddress, sizeof(newaddress), "2.%s.%s", myTierAddress + 2, failedEth + 3);
+        printf("\n newaddress = %s\n", newaddress);
+
+        // Tejas addition - count grandchildren of newaddress (included in delete message to peers)
+        int matchCount = 0;
+        current = tablehead;
+        while (current != NULL) {
+            if (checkIfGrandParent(current->tier_addr, newaddress) && !is_label_processed(current->tier_addr)) {
+                matchCount++;
+            }
+            current = current->next;
+        }
+
+        if (matchCount == 0) {
+            printf("\nNo new labels to process.\n");
+            return;
+        }
+
+        // Tejas addition - collect and remove newaddress grandchildren from routing table
+        char (*matchedLabels)[128] = NULL;
+        if (matchCount > 0) {
+            matchedLabels = malloc(matchCount * sizeof(*matchedLabels));
+            if (matchedLabels == NULL) { perror("malloc matchedLabels"); return; }
+            current = tablehead;
+            int index = 0;
+            while (current != NULL) {
+                if (checkIfGrandParent(current->tier_addr, newaddress) && !is_label_processed(current->tier_addr)) {
+                    printf("Found grand child %s\n", current->tier_addr);
+                    strcpy(matchedLabels[index], current->tier_addr);
+                    add_processed_label(current->tier_addr);
+                    index++;
+                }
+                current = current->next;
+            }
+            // myTier=3 suppresses auto-send in delete_entry_LL_Addr_updated
+            modify_LL_updated(matchedLabels, matchCount, recvOnEtherPort, 3);
+        }
+
+        // Tejas addition - build message: newaddress + newaddress grandchildren only
+        // Grandchildren of OTHER D-node labels on the same port are NOT removed — those
+        // routes are still reachable through other C-nodes (the D-node is still alive).
+        // Do NOT call delete_neighbour_by_failedPort() — outer delete() loop handles it
+        int totalCount = matchCount + 1;
+        char* combinedLabels[totalCount];
+        combinedLabels[0] = newaddress;
+        if (matchedLabels) {
+            for (int i = 0; i < matchCount; i++) {
+                combinedLabels[i + 1] = matchedLabels[i];
+            }
+        }
+
+        printf("Sending delete message with %d labels: %s", totalCount, newaddress);
+        for (int i = 0; i < matchCount; i++) {
+            printf(", %s", matchedLabels[i]);
+        }
+        printf("\n");
+        publishIPLabelMap_updated(combinedLabels, totalCount, 1, recvOnEtherPort, false);
+
+        if (matchedLabels) free(matchedLabels);
+    }
+}
+// Tejas addition - end of rewritten deleteIPLabel
+
+
+/***************************************************************
+publishIPLabelMap()
+Input : Label that needs to be published, and action (int)
+	action : 1 - add
+	action : 2 - delete
+Output : No return value
+This function creates the payload as per the labels provided and sends to other child nodes
+*****************************************************************/
+
+void publishIPLabelMap(char label[], int action, char recvOnEtherPort[5]) {
+	//action : 1 - add, action : 2 - delete ,  if(myTierValue==1){
+	if (action == 1) {
+		printf("\nPublishIPLabelMap : label : %s", label);
+		char ctrlPayLoadC[200];
+		memset(ctrlPayLoadC, '\0', 200);
+		uint8_t numOfAddr = 1;//**1 samruddhi check
+		memcpy(ctrlPayLoadC, &numOfAddr, 1); // NS - memory of numAddr stored in ctrlPayLoadC
+		int cpLength = 1;
+		char tempAddrA[20];
+		memset(tempAddrA, '\0', 20);
+		strcpy(tempAddrA, label); //copy the t th tier address to tempAddrA
+		uint8_t localTierSizeA = strlen(tempAddrA);
+		//printf("TEST:(helloM_List) ctrl packet - localTierSizeA: %u  \n", localTierSizeA);
+		memcpy(ctrlPayLoadC + cpLength, &localTierSizeA, 1); // copying the tier address size
+		cpLength = cpLength + 1;
+		memcpy(ctrlPayLoadC + cpLength, tempAddrA, localTierSizeA); // copying the tier address
+		cpLength = cpLength + localTierSizeA;
+		setInterfaces(); //interfaceList is being set by this function
+		int loopCounter1 = 1;
+		//Check which interfaces get the message 
+		for (; loopCounter1 < interfaceListSize; loopCounter1++) {
+			//Tejas addition
+			if(myTierValue == 3 && strcmp(interfaceList[loopCounter1],ipPortToSkip)==0){
+						continue;
+			}
+			int match_Port = matchPort(interfaceList[loopCounter1]);
+			if (match_Port == 2) {
+				//MPLRCtrlSendCount++; //keeps track of the no of control messages sent
+				//gettimeofday(&down_time, NULL);
+                //d_time = ((double)down_time.tv_sec*1000000 + (double)down_time.tv_usec) / 1000000;
+               	//printf("\nIF_DIRECT_DOWN:%lf\n", d_time);
+				//Tejas addition
+				if((strcmp(recvOnEtherPort, interfaceList[loopCounter1])==0) || strcmp(interfaceList[loopCounter1],failedInterface)==0){
+					continue;
+				}
+				printf("\nSending MESSAGE_TYPE_PUBLISH_IP_DELETE message to - %s at CURRENT_TIME:%lf\n ", interfaceList[loopCounter1], getCurrentTime());
+				ctrlLabelSend(MESSAGE_TYPE_PUBLISH_IP_DELETE, interfaceList[loopCounter1], ctrlPayLoadC); //ctrlSend method is used to send Ethernet frame
+			}
+		}
+		interfaceListSize = 0;
+	}
+	if (action == 2) {
+		uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET);
+		int mplrPayloadLen = 0;
+		setInterfaces();
+		mplrPayloadLen = buildIPPublishPacket(mplrPayload, label);
+		//printf("mplrPayloadLen: %d\n",mplrPayloadLen);
+		if (mplrPayloadLen) {
+			int loopCounter2 = 1;
+			for (; loopCounter2 < interfaceListSize; loopCounter2++) {
+				// Message  TYPE 5.
+				int port_number = matchPort(interfaceList[loopCounter2]);
+				if (port_number == 2) {
+					printf("\nSending MESSAGE_TYPE_PUBLISH_IP_ADD message to - %s at ", interfaceList[loopCounter2]);
+					endNetworkSend(interfaceList[loopCounter2], mplrPayload, mplrPayloadLen);
+				}
+			}
+		}
+		interfaceListSize = 0;
+		free(mplrPayload);
+	}
+}
+
+ 
+void publishIPLabelMap_updated(char* deletedLabels[], int deletedCount, int action, char recvOnEtherPort[5], bool if_down_tier1) {
+
+    if (deletedCount <= 0) return; // No labels to process
+
+    if (action == 1 || action == 2) {
+        // Prepare the payload
+        char ctrlPayLoadC[200];
+        memset(ctrlPayLoadC, '\0', 200);
+
+        // Add the number of labels to the payload
+        uint8_t numOfAddr = deletedCount;
+        memcpy(ctrlPayLoadC, &numOfAddr, 1); // Store the number of labels
+        int cpLength = 1;
+        // Add all labels with their sizes to the payload
+        int index = 0;
+        for (int i = 0; i < deletedCount; i++) {
+            uint8_t labelSize = strlen(deletedLabels[i]); // Get label size
+            memcpy(ctrlPayLoadC + cpLength, &labelSize, 1); // Copy label size
+            cpLength += 1;
+            memcpy(ctrlPayLoadC + cpLength, deletedLabels[i], labelSize); // Copy label
+            cpLength += labelSize;
+        }
+
+        // Set interfaces
+        setInterfaces();
+        for (int i = 1; i < interfaceListSize; i++) {
+            // Skip interfaces based on conditions
+
+            if ((myTierValue == 3 && strcmp(interfaceList[i], ipPortToSkip) == 0) ||
+                strcmp(recvOnEtherPort, interfaceList[i]) == 0 ||
+                strcmp(interfaceList[i], failedInterface) == 0) {
+                continue;
+            }
+
+            int match_Port = matchPort(interfaceList[i]);
+
+			int checkChild = matchPort(recvOnEtherPort);
+			
+			if(myTierValue == 2){
+				if ((checkChild!=2 && match_Port == 2) || match_Port == 1 || (checkChild==2 && match_Port == 3)){
+					 printf("\nSending MESSAGE_TYPE_PUBLISH_IP_%s message to - %s at CURRENT_TIME:%lf\n",
+                       action == 1 ? "DELETE" : "ADD",
+                       interfaceList[i], getCurrentTime());
+
+                	ctrlLabelSend(action == 1 ? MESSAGE_TYPE_PUBLISH_IP_DELETE: MESSAGE_TYPE_PUBLISH_IP_ADD,
+                              interfaceList[i], ctrlPayLoadC);
+				}
+			}else if(myTierValue == 1){
+				if(if_down_tier1)
+				{
+					if(matchPort(interfaceList[i])!=1)
+					{
+						continue;
+					}
+				}
+				printf("\nSending MESSAGE_TYPE_PUBLISH_IP_%s message to - %s at CURRENT_TIME:%lf\n",
+                       action == 1 ? "DELETE" : "ADD",
+                       interfaceList[i], getCurrentTime());
+
+                ctrlLabelSend(action == 1 ? MESSAGE_TYPE_PUBLISH_IP_DELETE: MESSAGE_TYPE_PUBLISH_IP_ADD,
+                              interfaceList[i], ctrlPayLoadC);
+							  
+			}
+            
+        }
+        interfaceListSize = 0; // Reset interface list size
+    }
+}
+
+
+
+
+
+/****************************************************************************
+ * 
+ * 
+******************************************************************************/
+void findParentofDestination(char DestTierLabel[], char eth_addr1[], char* parentDest) {
+	char* parentofDest;
+	parentofDest = getParent(DestTierLabel, '.');
+	printf("\nGot Parent : %s", parentofDest);
+	struct nodeHL* fNode1 = headHL;
+	if (fNode1 == NULL) {
+		if (enableLogScreen) {
+			printf("\nERROR: Neighbor List is empty \n");
+		}
+	}
+	while (fNode1 != NULL) {
+		//while (fNode->next != NULL) {
+		if ((strlen(fNode1->tier) == strlen(parentofDest)) && ((strncmp(fNode1->tier, parentofDest, strlen(parentofDest)) == 0))) {
+			strcpy(eth_addr1, fNode1->port);
+			strcpy(parentDest, parentofDest);
+			return;
+			break;
+		}
+		else {
+			fNode1 = fNode1->next;
+		}
+	}
+	return;
+}
+
+
+/************************************************************************
+* joinChildTierParentUIDInterface()
+* method to join the Tier Value of the child , UID of the parent and the interface to which the parent is connected.
+* @return status (void) - method return none
+*************************************************************************/
+
+void joinChildTierParentUIDInterface(char childLabel[], char myTierAddress[], char myEtherPort[]) {
+	//printf("\n My TierAddress = %s", myTierAddress);
+	//Getting the UID of the label of the current address.
+	int i = 0;
+	while (myTierAddress[i] != '.') {
+		i++;
+	}
+	int curLengthChildLabel = strlen(childLabel);
+	strcpy(childLabel + curLengthChildLabel, myTierAddress + i);
+	//printf("\n After appending the uid of the parent, childLabel = %s ", childLabel);
+	char temp[10] = ".";
+	strcpy(temp + 1, myEtherPort + 3);
+	// printf("\n temp = %s", temp);
+	curLengthChildLabel = strlen(childLabel);
+	strcpy(childLabel + curLengthChildLabel, temp);
+	//printf("\n After appending the port ID, ChildLabel = %s", childLabel);
+}
+
+/****************************************************************************
+* printMyLabels()
+* method to print my labels.
+* @return status (void) - method return none
+*****************************************************************************/
+void printMyLabels() {
+	struct nodeTL* temp = headTL;
+	printf("\n\n********************%s**********************", __FUNCTION__);
+	if (temp == NULL) {
+		printf("\nMy labels are: No labels in table\n");
+		return;
+	}
+	printf("\nMy labels are: ");
+	while (temp->next != NULL) {
+		printf("label: %s ,Port: %s\n", temp->tier,temp->port);
+		temp = temp->next;
+	}
+	printf("label: %s , Port: %s \n", temp->tier,temp->port);
+	printf("\n");
+	return;
+}
+
+/****************************************************************************
+* printAddresstoResponse() for printing addr_list
+* method to print my labels.NS?? 
+* @return status (void) - method return none
+*******************************************************************************/
+void printAddresstoResponse() {
+	struct addr_list* temp = headaddr;
+	if (temp == NULL) {
+		printf("\n My Response labels are: No labels in response\n");
+	}
+	else {
+		printf("\n My Response labels are: \n");
+		while (temp->next != NULL) {
+			printf(" %s ,", temp->label);
+			temp = temp->next;
+		}
+		printf("%s \n", temp->label);
+	}
+	return;
+}
+
+/***********************************************************************************
+ * 
+ *     
+*************************************************************************************/
+void add_LL(char label[10]) {
+	int endNWCount = 1;
+	int myTotalTierAddress = 1;
+	if (endNode == 0) { //endNode is updated to 0, if we are at edge node, ie if edgeNode is 0
+		int index1, index2;
+		int numTemp = 0;
+		for (index1 = 0; index1 < myTotalTierAddress; index1++) {
+			for (index2 = 0; index2 < endNWCount; index2++) {
+				struct addr_tuple* myAddr1 = (struct addr_tuple*)malloc(sizeof(struct addr_tuple));
+				strcpy(myAddr1->tier_addr, label);  // myaddr is a pointer that points to the first elment in the array i.e. 
+				myAddr1->ip_addr.s_addr = (unsigned long int) malloc(sizeof(unsigned long int));
+				memset(&myAddr1->ip_addr.s_addr, '\0', sizeof(myAddr1->ip_addr.s_addr));
+				myAddr1->ip_addr.s_addr = ips[index2].s_addr;  // NS is this correct? - memcopy?
+				char* temp11;
+				myAddr1->cidr = (uint8_t)cidrs[index2];
+				strcpy(myAddr1->etherPortName, portName[index2]);
+				myAddr1->if_index = -1;
+				myAddr1->isNew = true;
+				myAddr1->next == NULL;
+				add_entry_LL(myAddr1);
+
+				printf("%d", numTemp);
+			}
+		}
+	}
+	return;
+}
+
+//===========================================
+//MESSAGE TYPES
+// Receiving message types 
+//===========================================
+void hello_msg(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+	// MPLRCtrlReceivedCount++;
+	//MPLROtherReceivedCount--;
+	int tierAddrTotal = (ethhead[15]);
+	int lengthIndex = 16;
+	int z = 0;
+	//printf("\n received hello message ");
+	// gettimeofday(&current_time , NULL);
+    //printf("Received hello message at time: %ld.%06ld ----- on interface %s \n\n", current_time.tv_sec, current_time.tv_usec, recvOnEtherPort);
+	for (; z < tierAddrTotal; z++) {
+		int lengthOfTierAddrTemp = 0;
+		lengthOfTierAddrTemp = (ethhead[lengthIndex]);
+		unsigned char tierAddrTemp[lengthOfTierAddrTemp];
+		memset(tierAddrTemp, '\0', lengthOfTierAddrTemp + 1);
+		lengthIndex = lengthIndex + 1;
+		memcpy(tierAddrTemp, &ethhead[lengthIndex], lengthOfTierAddrTemp);
+		lengthIndex = lengthIndex + lengthOfTierAddrTemp;
+		int stablePort = 0; //stablePort - 1 is stable 
+		stablePort = staging(recvOnEtherPort);
+		if (stablePort == 0 && programStableFlag == 1) {
+			printf("\nsending NULL join on: %s", recvOnEtherPort);
+			sendNullJoin(recvOnEtherPort);
+		}  // 12/1/2021 - send Null Join if an iterface is down and came up- NS - to dod 
+		if (stablePort == 1) {
+			int isNewPort = 0;
+			//1 : if new node is added or appended to the linked list 
+			//0 : if a node is just updated 
+			isNewPort = insert(tierAddrTemp, recvOnEtherPort);
+			if (isNewPort == 1 && programStableFlag == 1) {
+				printf("\ninterface came up\n");
+				printf("\nSending NULL join on: %s", recvOnEtherPort);
+				sendNullJoin(recvOnEtherPort);
+			}// 12/1/2021 - send Null Join if an iterface is down and came up
+		}
+	}
+}
+/************************************************************************
+ * 
+ * 
+ ************************************************************************/
+void encaps_ip_msg(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr, int *n) {
+	printf("\nReceived Message Type is MESSAGE_TYPE_DATA\n");
+	//MPLRDataReceivedCount++;
+	//MPLROtherReceivedCount--;
+	unsigned char desLenTemp[2];
+	sprintf(desLenTemp, "%u", ethhead[15]);
+	uint8_t desLen = atoi(desLenTemp);
+	printf("  Destination Tier Length  : %d \n", desLen);
+	char destLocal[20];
+	memset(destLocal, '\0', 20);
+	memcpy(destLocal, &ethhead[16], desLen);
+	printf("  Destination Tier (Local) : %s \n", destLocal);
+
+	char finalDes[20];
+	memset(finalDes, '\0', 20);
+	memcpy(finalDes, &destLocal, desLen);
+	printf("  Destination Tier (Final) : %s \n", finalDes);
+
+	int tempLoc = 16 + desLen;
+	unsigned char srcLenTemp[2];
+	sprintf(srcLenTemp, "%u", ethhead[tempLoc]);
+	uint8_t srcLen = atoi(srcLenTemp);
+	printf("        Source Tier Length : %d \n", srcLen);
+
+	tempLoc = tempLoc + 1;
+	char srcLocal[20];
+	memset(srcLocal, '\0', 20);
+	memcpy(srcLocal, &ethhead[tempLoc], srcLen);
+	printf("      Source Tier (Local) : %s \n", srcLocal);
+
+	char finalSrc[20];
+	memset(finalSrc, '\0', 20);
+	memcpy(finalSrc, &srcLocal, srcLen);
+	printf("      Source Tier (Final) : %s \n", finalSrc);
+
+	tempLoc = tempLoc + srcLen;
+	int packetFwdStatus = -1;
+	if (isTierSet() == 0) {
+		printf("\nCalling packetForwardAlgorithm - Destination label = %s", finalDes);
+		setTierInfo(headTL->tier);
+		packetFwdStatus = packetForwardAlgorithm(tierAddress, finalDes);
+	}
+	else {
+		//errorCount++;
+		printf("\n error");
+	}
+	if (packetFwdStatus == 0) { //check if the packet reached the destination by checking all the labels of the node
+		int isDestination = CheckAllDestinationLabels(fwdTierAddr);
+		if (isDestination == 0) {
+			int decapsPacketSize = *n - tempLoc;
+			unsigned char decapsPacket[decapsPacketSize];
+			memset(decapsPacket, '\0', decapsPacketSize);
+			memcpy(decapsPacket, &buffer[tempLoc],
+				decapsPacketSize);
+			unsigned char tempIPTemp[20];
+			sprintf(tempIPTemp, "%u.%u.%u.%u", decapsPacket[16],
+				decapsPacket[17], decapsPacket[18],
+				decapsPacket[19]);
+			struct in_addr* nwIPTemp = getNetworkIP(tempIPTemp);
+			char* portNameTemp = findPortName(nwIPTemp);
+			
+			if (portNameTemp != NULL) { // check for null - if not null, call dataDecapsulation
+				//printf("Decaps at port %s \n", portNameTemp);
+				struct iphdr* iphUDP = (struct iphdr*)decapsPacket;
+				printf("\n%s : the protocol is =%d\n", __FUNCTION__, iphUDP->protocol);
+				switch (iphUDP->protocol) //Check the Protocol and do accordingly...
+				{
+				case 1:  //ICMP Protocol
+					dataDecapsulation(portNameTemp, decapsPacket, decapsPacketSize);
+					break;
+				case 2:  //IGMP Protocol
+					dataDecapsulation(portNameTemp, decapsPacket, decapsPacketSize);
+					break;
+				case 6:  //TCP Protocol
+					dataDecapsulation(portNameTemp, decapsPacket, decapsPacketSize);
+					break;
+				case 17: //UDP Protocol
+					dataDecapsulationUDP(portNameTemp, decapsPacket, decapsPacketSize);
+					break;
+				default: //Some Other Protocol like ARP etc.
+					dataDecapsulation(portNameTemp, decapsPacket, decapsPacketSize);
+					break;
+				}
+				//MPLRDecapsulated++;
+			}
+			else {
+				//errorCount++;
+				printf("\n error");
+			}
+		}
+		else {
+			if (isFWDFieldsSet() == 0) {
+
+				int MPLRPacketSize = *n - 14;
+				unsigned char MPLRPacketFwd[MPLRPacketSize];
+				memset(MPLRPacketFwd, '\0', MPLRPacketSize);
+				memcpy(MPLRPacketFwd, &buffer[14],
+					MPLRPacketSize);
+				dataFwd(fwdInterface, MPLRPacketFwd,
+					MPLRPacketSize);
+				// MPLRDataFwdCount++;
+			}
+		}
+	}
+	else {
+		//errorCount++;
+		printf("\n error");
+	}
+}
+
+/************************************************************************
+ * 
+ * 
+ **************************************************************************/
+void ip_tier_mapping_msg(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+	printf("\nReceived Message Type is MESSAGE_TYPE_ENDNW on : %s CURRENT_TIME: %lf", recvOnEtherPort, getCurrentTime());
+	//MPLRMsgVReceivedCount++;
+	//MPLROtherReceivedCount--;
+	uint8_t totalEntries = ethhead[15]; //skip NS ?? // Add the data entries in the payload if not already present.
+	uint8_t action = ethhead[16]; //skip  NS ??
+	int index = 17;
+	if (myTierValue == 1) { // check my tier - if I am not tier 1, skip steps unitl 2206 NS 
+		//This is to make sure the action 1 with entire Label list from failed interface is dodged 
+		//when the interface becames active after being down
+		if (actionflag == 0 && (action == 1 && totalEntries > 4)) {
+			return;
+		}
+		int hasDeletions = 0;
+		while (totalEntries > 0) {
+			uint8_t tierLen = ethhead[index];
+			uint8_t tierAddr[tierLen + 1];
+			memset(tierAddr, '\0', tierLen + 1);
+			index++; // pass the length byte
+			memcpy(tierAddr, &ethhead[index], tierLen);
+			index += tierLen;
+			tierAddr[tierLen] = '\0';
+			printf("\n\nTierLen :%u TierAddr: %s\n", tierLen, tierAddr);
+			uint8_t ipLen = ethhead[index];
+			struct in_addr ipAddr;
+			index++; // pass the length byte
+			memcpy(&ipAddr, &ethhead[index],
+				sizeof(struct in_addr));
+			if (strcmp(ip_add, inet_ntoa(ipAddr)) == 0) { //Only entries from other nodes are to be appended, else discard
+				totalEntries--;
+				continue;
+			}
+			index = index + sizeof(struct in_addr);
+			uint8_t cidr = ethhead[index];
+			index++; // pass the length of cidr
+			if (action == MESSAGE_TYPE_ENDNW_ADD) {
+				printf("\nipLen :%u ipAddr: %s cidr: %u", ipLen, inet_ntoa(ipAddr), cidr); //cidr %u to %d
+				struct addr_tuple* a = (struct addr_tuple*)malloc(sizeof(struct addr_tuple));
+				memset(a, '\0', sizeof(struct addr_tuple));
+				strcpy(a->tier_addr, tierAddr);
+				char tempaddr[20];
+				memset(tempaddr, '\0', 20);
+				strcpy(tempaddr, tierAddr);
+				if (find_entry_LL(&ipAddr, tierAddr) == NULL) {
+					a->if_index = src_addr.sll_ifindex; // insert info about index from which the packet has been received from.
+					a->isNew = true;
+					memcpy(&a->ip_addr, &ipAddr,
+						sizeof(struct in_addr));
+					a->cidr = cidr;
+					add_entry_LL(a);
+					churn_flag = true;  //implement publish_add - -  to do Samruddhi 04/15/2022
+					print_entries_LL();
+					// if (programStableFlag == 1)  NS - commented it because it was sending message to add on all ports 
+					// publishIPLabelMap(tempaddr, 2);  NS ??
+				}
+			}
+			else if (action == MESSAGE_TYPE_ENDNW_UPDATE) {
+				printf("\naction == MESSAGE_TYPE_ENDNW_UPDATE");
+				// Still not implemented, can be done by recording interface index maybe
+			}
+			else if (action == MESSAGE_TYPE_ENDNW_REMOVE) {
+				printf("\naction == MESSAGE_TYPE_ENDNW_REMOVE");
+
+				if (delete_entry_LL_IP(ipAddr)) {
+					churn_flag = true;
+					hasDeletions++;
+				}
+			}
+			else if (action == MESSAGE_TYPE_ENDNW_REMOVE_ADDR) {
+				printf("\naction == MESSAGE_TYPE_ENDNW_REMOVE_ADDR ");
+				if (delete_entry_LL_Addr(tierAddr,recvOnEtherPort)) {
+					churn_flag = true;
+					print_entries_LL();
+					hasDeletions++;
+				}
+			}
+			totalEntries--;
+		} // end of while
+		// Send this frame out of interfaces other than where it came from
+		if (hasDeletions && (action == MESSAGE_TYPE_ENDNW_REMOVE || action == MESSAGE_TYPE_ENDNW_REMOVE_ADDR)) {
+			uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET);
+			int mplrPayloadLen = 0;
+			int z = 0;
+			for (z = 14; z < index; z++, mplrPayloadLen++) {
+				mplrPayload[mplrPayloadLen] = ethhead[z];
+			}
+			setInterfaces(); //interfaceList is being set by this function
+			if (mplrPayloadLen) {
+				int ifs2 = 1;
+				for (; ifs2 < interfaceListSize; ifs2++) {
+					if (strcmp(recvOnEtherPort, interfaceList[ifs2]) != 0) { // dont send update, if it is from the same interface. NS - USE THIS 
+						endNetworkSend(interfaceList[ifs2], mplrPayload, mplrPayloadLen);
+					}
+				}
+			}
+			free(mplrPayload);
+			freeInterfaces();
+			interfaceListSize = 0;
+			print_entries_LL();
+		}
+		checkEntriesToSync(); //Sync tier1 node IP mapping tables -- Samruddhi -- 1/26/2022
+	}
+	else {
+		char parentTierAdd[20];
+		memset(parentTierAdd, '\0', 20);
+		findParntLongst(tierAddress, parentTierAdd);
+		setByTierOnly(parentTierAdd, true);
+		//printf("\nPassing  IP mapping payload to %s via %s", parentTierAdd, fwdInterface);
+		while (totalEntries > 0) {
+			uint8_t tierLen = ethhead[index];
+			uint8_t tierAddr[tierLen + 1];
+			memset(tierAddr, '\0', tierLen + 1);
+			index++; // pass the length byte
+			memcpy(tierAddr, &ethhead[index], tierLen);
+			index += tierLen;
+			tierAddr[tierLen] = '\0';
+			uint8_t ipLen = ethhead[index];
+			struct in_addr ipAddr;
+			index++; // pass the length byte
+			memcpy(&ipAddr, &ethhead[index],
+				sizeof(struct in_addr));
+			index = index + sizeof(struct in_addr);
+			uint8_t cidr = ethhead[index];
+			char parentTierAdd[20];
+			memset(parentTierAdd, '\0', 20);
+			findParntLongst(tierAddress, parentTierAdd);
+			setByTierOnly(parentTierAdd, true);
+			printf("\nReceived ip address = %s and its cdir %d and need to send it my parent %s via %s", inet_ntoa(ipAddr), cidr, parentTierAdd, fwdInterface);
+			index++; // pass the length of cidr
+			totalEntries--;
+		}
+		uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET);
+		int mplrPayloadLen = 0;
+		int z = 0;
+		for (z = 14; z < index; z++, mplrPayloadLen++) {
+			mplrPayload[mplrPayloadLen] = ethhead[z];
+		}
+		endNetworkSend(fwdInterface, mplrPayload, mplrPayloadLen);
+	}
+}
+/**********************************************************************************
+ * Tejas 
+ * if the tierValue is < my TierValue , ignore the message
+	else   generate the label based on the interface it recived the message from
+	Send the label to the node  
+***********************************************************************************/
+void addOrUpdateInterfaceLabels(char recvOnEtherPort[5], struct labels* labelList) {
+    struct childInterfaceToLabelList* current = headInterfaceLabel;
+
+    // Check if the interface already exists
+    while (current != NULL) {
+        if (strcmp(current->interface, recvOnEtherPort) == 0) {
+            // Free the existing label list before updating
+            struct labels* temp = current->labelList;
+            while (temp != NULL) {
+                struct labels* toFree = temp;
+                temp = temp->next;
+                free(toFree);
+            }
+            // Update with the new label list
+            current->labelList = labelList;
+            return;
+        }
+        current = current->next;
+    }
+
+    // If the interface doesn't exist, create a new node
+    struct childInterfaceToLabelList* newNode = (struct childInterfaceToLabelList*)malloc(sizeof(struct childInterfaceToLabelList));
+    strcpy(newNode->interface, recvOnEtherPort);
+    newNode->labelList = labelList;
+    newNode->next = headInterfaceLabel;
+    headInterfaceLabel = newNode;
+}
+
+
+void deleteLabelsByInterface(char recvOnEtherPort[5]) {
+    struct childInterfaceToLabelList* current = headInterfaceLabel;
+    struct childInterfaceToLabelList* prev = NULL;
+
+
+    while (current != NULL) {
+        if (strcmp(current->interface, recvOnEtherPort) == 0) {
+            // Print the labels before deleting
+            struct labels* temp = current->labelList;
+          //  printf("Labels to be deleted for interface %s:\n", recvOnEtherPort);
+            while (temp != NULL) {
+               // printf("  %s\n", temp->label);  // Assuming the label field is 'label'
+                temp = temp->next;
+            }
+
+            // Free the label list
+            temp = current->labelList;  // Re-initialize temp to free the list
+            while (temp != NULL) {
+                struct labels* toFree = temp;
+                temp = temp->next;
+                free(toFree);
+            }
+
+            // Remove the interfaceLabels node
+            if (prev == NULL) {
+                headInterfaceLabel = current->next;
+            } else {
+                prev->next = current->next;
+            }
+            free(current);
+        //    printf("\nDeleted labels for interface: %s\n", recvOnEtherPort);
+            return;
+        }
+        prev = current;
+        current = current->next;
+    }
+
+    printf("\nNo labels found for interface: %s\n", recvOnEtherPort);
+}
+
+
+void msg_typ_join(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+	printf("\n\n********************%s**********************", __FUNCTION__);
+	printf("\nReceived MESSAGE_TYPE_JOIN from : %s CURRENT_TIME:%lf", recvOnEtherPort,getCurrentTime());
+	//MPLRMsgVReceivedCount++;
+	//MPLROtherReceivedCount--;
+	int stablePort = 0;
+	stablePort = staging(recvOnEtherPort);
+	// NS ??? - we have to count joins etc for the three message from neighbor count 
+	// NS ??? if(stablePort==1) check if count=3 and print 
+	uint8_t tierValueRequestedNode = ethhead[15];
+	printf("\nMy Tier Value = %d ", myTierValue);
+	printf("\nTier Value of the Requested Node = %d ", tierValueRequestedNode);
+	if (myTierValue < tierValueRequestedNode && strcmp(recvOnEtherPort, "eth0") != 0) {
+		//printf("\nMESSAGE_TYPE_JOIN request received from a node at lower tier ");
+		printf("\nInterface from which the request recvd = %s", recvOnEtherPort);
+		struct labels* labelList;
+		int numbNewLabels = generateChildLabel(recvOnEtherPort, tierValueRequestedNode, &labelList);
+
+
+		addOrUpdateInterfaceLabels(recvOnEtherPort, labelList);
+
+		//printf("\n%s : Labels are generated\n", __FUNCTION__);
+		// Generate the payload for sending this message.
+		char labelAssignmentPayLoad[200];
+		int cplength = 0;
+		memset(labelAssignmentPayLoad, '\0', 200);
+		uint8_t numberOfLabels = (uint8_t)numbNewLabels; // Need to modify - NS ??
+		memcpy(labelAssignmentPayLoad + cplength, &numberOfLabels, 1);
+		//printf("\n %s : labelAssignmentPayLoad(string) = %x", __FUNCTION__, *labelAssignmentPayLoad);// NS  ?? to fix 
+		cplength++;
+		struct labels* temp = labelList;
+		while (temp != NULL) {
+			// printf("\n label list is not null\n");
+			//printf("\nCurrent label in the message = %s\n", temp->label);
+			uint8_t labelLength = (uint8_t)strlen(temp->label); // Need to modify - NS ??
+			memcpy(labelAssignmentPayLoad + cplength, &labelLength, 1);
+			cplength++;
+			memcpy(labelAssignmentPayLoad + cplength, temp->label, labelLength); // NS ?? Need to modify
+			cplength = cplength + labelLength;
+			temp = temp->next;
+			// printf("\n %s : GETTING THE NEXT LABEL \n", __FUNCTION__);
+		}
+		printf("\nSending MESSAGE_TYPE_LABELS_AVAILABLE on interface, "
+			"%s, LabelSize=%d \n", recvOnEtherPort,
+			(int)strlen(labelAssignmentPayLoad)); // NS ?? all interfaces 
+		ctrlLabelSend(MESSAGE_TYPE_LABELS_AVAILABLE, recvOnEtherPort, labelAssignmentPayLoad);
+	}
+}
+
+/*************************************************************************** 
+ * Tejas 
+ * 
+****************************************************************************/
+void msg_typ_labl_available(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+	printf("\n\n********************%s**********************", __FUNCTION__);
+	//printf("\n\nReceived MESSAGE_TYPE_LABELS_AVAILABLE");
+	//MPLRMsgVReceivedCount++;
+	//MPLROtherReceivedCount--;
+	setInterfaces();
+	int stablePort = 0;
+	stablePort = staging(recvOnEtherPort);
+	int match_Port = matchPort(recvOnEtherPort);
+	if (match_Port == 0) { 	//to_parent port tag 
+		tagport(recvOnEtherPort, 3);
+	}
+	int numberLabels = ethhead[15];
+	printf("\nNumber of Labels available = %d\n", numberLabels);
+	int i = 0;
+	struct labels* acceptedList;
+	int messagePointer = 16; // Accepting each label here
+	for (; i < numberLabels; i++) {
+		int labelLength = ethhead[messagePointer];
+		//printf("\nLabel Length = %d\n", labelLength);
+		messagePointer++;
+		char label[20];
+		memset(label, '\0', 10);
+		memcpy(label, ethhead + messagePointer, labelLength);
+		//printf("\n Label  =%s Label length= %d\n", label, (int)strlen(label));
+		printf("\nLabel  =%s", label);
+		messagePointer = messagePointer + labelLength;
+		printf("\nMessage Pointer in Labels add = %d", messagePointer);
+		if (!recvdLabel) {
+			recvdLabel = true;
+			setTierInfo(label); // set the label here For Default tier address 
+		}
+		int check = insertTierAddr_updated(label,recvOnEtherPort); // pass it to tier address list
+		if (check == 1) {
+			if (myTierValue == 2 && label[0] == '2')
+				clear_neighbor_blacklist_for_parent(label);
+			add_LL(label);
+			churn_flag = true; // NS ??
+			printf("\nChecking my Tier Addresses");
+			//printf("\nAdding the label to the list %s", label);
+			if (!acceptedList) { //creating a list of accepted labels
+				printf("\nAdding the first label to the list\n");
+				acceptedList = (struct labels*)malloc(sizeof(struct labels));
+				strncpy(acceptedList->label, label, strlen(label));
+				acceptedList->next = NULL;
+				notify_myLabels_Update(1, label);
+			}
+			else {
+				printf("\nAdding all other labels to the list\n");
+				struct labels* newLabel = (struct labels*)malloc(sizeof(struct labels));
+				strncpy(newLabel->label, label, strlen(label));
+				newLabel->next = acceptedList;
+				acceptedList = newLabel;
+				// printf("insertion success");
+				print_entries_LL();
+				notify_myLabels_Update(1, label);
+				// 12/7/2021 : Send Msg V just after ip to label mapping is updated - NS ?? 
+				uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET); // If new port we have to advertise our tierAdd<->IPAdd table.
+				int mplrPayloadLen = 0;
+				mplrPayloadLen = buildPayload(mplrPayload, COMPLETE_TABLE, 0); //NS - buildPayload defined in endNW.c 
+				print_entries_LL();
+				if (mplrPayloadLen) {
+					//printf("endNetworkSend after insert");
+					endNetworkSend(recvOnEtherPort, mplrPayload, mplrPayloadLen); //method to send MSG TYPE V 
+				}
+				free(mplrPayload);
+			}
+		}
+		checkEntriesToAdvertise();
+		print_entries_LL();
+	}
+	struct labels* temp = acceptedList;
+	if (temp != NULL) { // Generate Labels Accepted Message
+		int cplength = 0;
+		char labelAssignmentPayLoad[200];
+		memset(labelAssignmentPayLoad, '\0', 200);
+		uint8_t numLabels = (uint8_t)numberLabels; // NS ?? Set tbe labels here .. TO be done
+		memcpy(labelAssignmentPayLoad + cplength, &numLabels, 1);
+		cplength++;
+		while (!temp) { // Copy all other labels to the labels accepted message
+			char label[10];
+			memcpy(label, temp->label, strlen(temp->label));
+			uint8_t labelLength = strlen(label);
+			memcpy(labelAssignmentPayLoad + cplength, &numLabels, 1);
+			cplength++;
+			memcpy(labelAssignmentPayLoad + cplength, label, labelLength);
+			cplength = cplength + labelLength;
+		}
+		ctrlLabelSend(MESSAGE_TYPE_LABELS_ACCEPTED, recvOnEtherPort, labelAssignmentPayLoad); // Sending labels accepted message
+		printMyLabels();
+		//printf("\n Calling printMyLabels linenumber =%d", __LINE__);
+	}
+}
+
+/******************************************************************************
+ * Tejas
+ *   NS ?? - no action just a print out   
+*******************************************************************************/
+void msg_typ_labl_accptd(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+	int stablePort = 0;
+	stablePort = staging(recvOnEtherPort);
+	printf("\nReceived MESSAGE_TYPE_LABELS_ACCEPTED \n");
+	//MPLRMsgVReceivedCount++;
+	//MPLROtherReceivedCount--;
+	//timestamp();
+}
+
+/*******************************************************************************
+ * 
+ * 
+********************************************************************************/
+void msg_typ_labl_add(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+	printf("\nReceived MESSAGE_TYPE_MY_LABELS_ADD on : %s CURRENT_TIME:%lf\n", recvOnEtherPort,getCurrentTime());
+	//MPLRMsgVReceivedCount++;
+	//MPLROtherReceivedCount--;
+	//NS ?? do we need this timestamp();
+	int tierAddrTotal = (ethhead[15]);
+	printf("No. of Tier Addr : %d\n", tierAddrTotal);
+	int lengthIndex = 16;
+	int z = 0;
+	for (; z < tierAddrTotal; z++) {
+		int lengthOfTierAddrTemp = 0;
+		lengthOfTierAddrTemp = (ethhead[lengthIndex]);
+		printf("      Tier Address  Length : %d \n", lengthOfTierAddrTemp);
+		printf("      Number of Tier Address : %d, value of count : %d \n", tierAddrTotal, z);
+		unsigned char tierAddrTemp[lengthOfTierAddrTemp];
+		memset(tierAddrTemp, '\0', lengthOfTierAddrTemp + 1);
+		lengthIndex = lengthIndex + 1;
+		memcpy(tierAddrTemp, &ethhead[lengthIndex], lengthOfTierAddrTemp);
+		lengthIndex = lengthIndex + lengthOfTierAddrTemp;
+		int stablePort = 0;
+		stablePort = staging(recvOnEtherPort);
+		if (stablePort == 1) { //stablePort 1 is stable 
+			int isNewPort = 0;  //1 : if new node is added or appended to the linked lis, 0 : if a node is just updated 
+			isNewPort = insert(tierAddrTemp, recvOnEtherPort);
+			churn_flag = true;
+		}
+	}
+	int match_Port = matchPort(recvOnEtherPort);
+	if (match_Port == 3) {
+		sendNullJoin(recvOnEtherPort);
+	}
+}
+
+
+
+
+void msg_typ_labl_delt(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+    printf("\nReceived MESSAGE_TYPE_MY_LABELS_DELETE on %s at CURRENT_TIME: %lf\n", recvOnEtherPort, getCurrentTime());
+    printf("\tETH_SIZE: %lu\n", sizeof(unsigned char)*strlen(ethhead));
+
+    uint8_t totalEntries = ethhead[15];
+    int index = 16;
+    printf("Total Entries: %d\n", totalEntries);
+
+    if (totalEntries == 0) {
+        printf("No labels received for deletion.\n");
+        return;
+    }
+
+    char labels[totalEntries][128];  // Assuming max label length is 128
+    char* newLabels[totalEntries];
+    int newLabelCount = 0;
+
+    // Extract labels from ethhead
+    for (int i = 0; i < totalEntries; i++) {
+        uint8_t labelLength = ethhead[index++];
+        memcpy(labels[i], &ethhead[index], labelLength);
+        labels[i][labelLength] = '\0';  // Null-terminate label
+        index += labelLength;
+
+        printf("Label %d: %s\n", i + 1, labels[i]);
+
+        // Check if label is already processed
+        if (!is_label_processed(labels[i])) {
+            newLabels[newLabelCount++] = labels[i];  // Add to new list
+            printf("Adding label to processed labels.\n");
+            add_processed_label(labels[i]);
+        }
+    }
+
+    if (newLabelCount == 0) {
+        printf("All labels are already processed. No action required.\n");
+        return;
+    }
+
+    // Process label deletions based on tier value
+    if (myTierValue == 3) {
+		printf("\nDoes this ever run?\n");
+		char** deletedLabels;
+		int deletedCount;
+        if (delete_entry_LL_Addr_updated(newLabels, newLabelCount, recvOnEtherPort, myTierValue, deletedLabels, deletedCount)) {
+            add_failed_entry_LL_updated(newLabels, newLabelCount);
+            churn_flag = true;
+            print_entries_LL();
+        }
+        if (delete_neighbour(newLabels, newLabelCount, recvOnEtherPort)) {
+		
+            //printf("\nNeighbour Table after removing the addresses of the unreachable node CURRENT_TIME: %lf\n", getCurrentTime());
+            printNeighbourTable(true);
+            printMyLabels();
+        }
+        publishIPLabelMap_updated(newLabels, newLabelCount, 1, recvOnEtherPort,false);
+
+    } 
+	
+	else if (myTierValue == 1) {
+    	int totalDeletedCount = 0;
+    
+    	// Process all labels at once
+    	char** allDeletedLabels = deleteLabelsAndCheckGrandparents(newLabels, newLabelCount, &totalDeletedCount);
+
+    	// Publish deleted labels if any
+    	if (allDeletedLabels && totalDeletedCount > 0) {
+        	printf("Sending below labels:\n");
+        	for (int i = 0; i < totalDeletedCount; i++) {
+            	printf("%s\n", allDeletedLabels[i]);
+        	}
+
+        	int match_Port = matchPort(recvOnEtherPort);
+        	if (match_Port != 1) {
+            	publishIPLabelMap_updated(allDeletedLabels, totalDeletedCount, 1, recvOnEtherPort, false);
+        	}
+
+        	// Free memory
+        	for (int i = 0; i < totalDeletedCount; i++) {
+            	free(allDeletedLabels[i]);
+        	}
+        	free(allDeletedLabels);
+
+        	churn_flag = true;
+        	print_entries_LL();
+    	}
+	}
+	 else if(myTierValue == 2) {
+		if (delete_neighbour(newLabels, newLabelCount, recvOnEtherPort)) {
+		
+            //printf("\nNeighbour Table after removing the addresses of the unreachable node at CURRENT_TIME: %lf\n", getCurrentTime());
+            printNeighbourTable(true);
+            printMyLabels();
+        }
+		publishIPLabelMap_updated(newLabels, newLabelCount, 1, recvOnEtherPort, false);
+	}
+
+    // Handle failed entries and notify other interfaces
+    if (failedLL_head != NULL) {
+        printf("\nin failedLL_head\n");
+        setInterfaces();
+        printf("\nafter setInterfaces\n");
+        uint8_t* mplrPayload = allocate_ustrmem(IP_MAXPACKET);
+        int mplrPayloadLen = buildPayloadRemoveAdvts(mplrPayload, failedLL_head, 4);
+
+        if (mplrPayloadLen > 0) {
+            for (int i = 1; i < interfaceListSize; i++) {  // Skip eth0
+                if (matchPort(interfaceList[i]) == 1) {
+                    endNetworkSend(interfaceList[i], mplrPayload, mplrPayloadLen);
+                }
+            }
+        }
+
+        free(mplrPayload);
+        
+        freeInterfaces();
+        interfaceListSize = 0;
+    }
+}
+
+
+/*************************************************************************************
+ * 
+ * 
+***************************************************************************************/
+void msg_typ_rqst_ip(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+	uint8_t totalEntries = 0;
+	printf("\nReceived Message Type is MESSAGE_TYPE_REQUEST_IP_RESOLVE : %s \n", recvOnEtherPort);
+	//MPLRMsgVReceivedCount++;
+	//MPLROtherReceivedCount--;
+	int lengthIndex = 16;
+	int lengthOfMytier = 0;
+	lengthOfMytier = (ethhead[lengthIndex]);
+	unsigned char MytierAddrTemp[lengthOfMytier];
+	memset(MytierAddrTemp, '\0', lengthOfMytier + 1);
+	lengthIndex = lengthIndex + 1;
+	memcpy(MytierAddrTemp, &ethhead[lengthIndex], lengthOfMytier);
+	lengthIndex = lengthIndex + lengthOfMytier;
+	int lengthOfTierAddrTemp = 0;
+	lengthOfTierAddrTemp = (ethhead[lengthIndex]);
+	unsigned char tierAddrTemp[lengthOfTierAddrTemp];
+	memset(tierAddrTemp, '\0', lengthOfTierAddrTemp + 1);
+	lengthIndex = lengthIndex + 1;
+	memcpy(tierAddrTemp, &ethhead[lengthIndex], lengthOfTierAddrTemp);
+	lengthIndex = lengthIndex + lengthOfTierAddrTemp;
+	printf("\n Message 12 from : %s", MytierAddrTemp);
+	if (myTierValue == 1) {
+		printf("\nMessage at tier 1 : Getting the labels for source and destination\n");
+		printf("\nResolving ip for destination label :  %s", MytierAddrTemp);
+		deleteList(); // NS ?? delete resolving list
+		char* tempTier = updateEndTierAddr(tierAddrTemp, MytierAddrTemp);
+		char destAddr[20];
+		memcpy(destAddr, tempTier, 20);
+		uint8_t cidr;
+		struct in_addr ip;
+		inet_pton(AF_INET, tierAddrTemp, &ip);
+		responseIPresolve(destAddr, ip, MytierAddrTemp, totalEntries, 1); //sending response to sender
+		deleteList();
+		printAddresstoResponse();
+		printf("\nForwarding source labels to destination ");
+		char mylabelIP[20];
+		findIPforLabel(MytierAddrTemp, mylabelIP);
+		char* tempTier1 = updateEndTierAddr(mylabelIP, tempTier); //  NS ??calling updateEndTierAddr double --- needs to change!! Samruddhi
+		uint8_t cidr1;
+		struct in_addr ip1;
+		inet_pton(AF_INET, mylabelIP, &ip1);
+		responseIPresolve(MytierAddrTemp, ip1, destAddr, totalEntries, 1);
+	}
+	else {
+		printf("\nelse : sent destination ip to my parent to resolve and will return to %s", MytierAddrTemp);
+		requestIPresolve(tierAddrTemp, MytierAddrTemp);
+	}
+}
+
+/************************************************************************
+ * 
+ * 
+***************************************************************************/
+void msg_typ_ip_res(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr, int *n) {
+	printf("\nReceived Message Type is MESSAGE_TYPE_RESPONSE_IP_RESOLVE: %s \n", recvOnEtherPort);
+	//MPLRMsgVReceivedCount++;
+	//MPLROtherReceivedCount--;
+	uint8_t totalEntries = ethhead[15]; //skip  NS?? - we are getting two ethhead[15] 
+	int tierAddrTotal = (ethhead[15]);
+	printf("  No. of Tier Addr : %d\n", tierAddrTotal);
+	int lengthIndex = 16;
+	int lengthOfMytier = 0;
+	lengthOfMytier = (ethhead[lengthIndex]); // check my tier - if I am not tier 1, skip some steps 
+	unsigned char MytierAddrTemp[lengthOfMytier];
+	memset(MytierAddrTemp, '\0', lengthOfMytier + 1);
+	lengthIndex = lengthIndex + 1;
+	memcpy(MytierAddrTemp, &ethhead[lengthIndex], lengthOfMytier);
+	lengthIndex = lengthIndex + lengthOfMytier;
+	printf("\n Message 13 for : %s", MytierAddrTemp); // NS ?? 
+	int chkDestLbl = 1;  //1=ERROR, 0=Success
+	chkDestLbl = CheckAllDestinationLabels(MytierAddrTemp); 	//check whether the packet reached the destination by checking all the labels of the node
+	printf("\n Message 13 chkDestLbl : %d", chkDestLbl);
+	if (chkDestLbl == 0)
+	{
+		printf("\n Message 13 (response) received at destination\n");
+		printf("\nAdding to my ip to label map:");
+		while (totalEntries > 0) {
+			int lengthOfTierAddrTemp = 0;
+			lengthOfTierAddrTemp = (ethhead[lengthIndex]);
+			unsigned char tierAddrTemp[lengthOfTierAddrTemp];
+			memset(tierAddrTemp, '\0', lengthOfTierAddrTemp + 1);
+			lengthIndex = lengthIndex + 1;
+			memcpy(tierAddrTemp, &ethhead[lengthIndex], lengthOfTierAddrTemp);
+			lengthIndex = lengthIndex + lengthOfTierAddrTemp;
+			printf("\nGot in response : %s", tierAddrTemp);
+
+			uint8_t ipLen = ethhead[lengthIndex];
+			struct in_addr ipAddr;
+			lengthIndex++; // pass the length byte
+			memcpy(&ipAddr, &ethhead[lengthIndex], sizeof(struct in_addr));
+
+			lengthIndex = lengthIndex + sizeof(struct in_addr);
+			uint8_t cidr = ethhead[lengthIndex];
+			lengthIndex++;
+			
+			if (strcmp(ip_add, inet_ntoa(ipAddr)) == 0) { //Only entries from other nodes are to be appended, else discard 
+				totalEntries--;
+				continue;
+			}
+			printf("\n IPLen :%u IPAddr: %s cidr: %u", ipLen, inet_ntoa(ipAddr), cidr); //cidr %u to %d
+			struct addr_tuple* a = (struct addr_tuple*)malloc(sizeof(struct addr_tuple));
+			memset(a, '\0', sizeof(struct addr_tuple));
+			strcpy(a->tier_addr, tierAddrTemp);
+
+			if (find_entry_LL(&ipAddr, tierAddrTemp) == NULL) {
+				a->if_index = src_addr.sll_ifindex; // insert info about index from which the packet has been received from.
+				a->isNew = true;
+				memcpy(&a->ip_addr, &ipAddr,
+					sizeof(struct in_addr));
+				a->cidr = cidr;
+				add_entry_LL(a);
+				churn_flag = true;
+				print_entries_LL();
+				totalEntries--;
+			}
+			else {
+				totalEntries--;
+			}
+		}
+	}
+	else {
+		printf("\n Message 13 (response) not for me! Send it to my child");
+		//structure of message 13 : Destination|Label|IP
+		//structure of responseIPresolve : resolved label, resolved ip, return to which label.
+		uint8_t ipLen = ethhead[lengthIndex];
+		struct in_addr ipAddr;
+		lengthIndex++; // pass the length byte
+		memcpy(&ipAddr, &ethhead[lengthIndex], sizeof(struct in_addr));
+		lengthIndex = lengthIndex + sizeof(struct in_addr);
+		uint8_t cidr = ethhead[lengthIndex];
+		lengthIndex++; // pass the length of cidr
+		unsigned char* headWithPayload; //Copying ethhead[14] till end in a buffer
+		int packetSize = *n - 14; // NS- remove MAC header
+		headWithPayload = (unsigned char*)malloc(packetSize);
+		memset(headWithPayload, '\0', packetSize);
+		memcpy(headWithPayload, &buffer[14], packetSize);
+		setInterfaces();
+		char parentofDest[20];
+		memset(parentofDest, '\0', 20); //forwarding the load as it is with replacing the head
+		char eth_addr1[20];
+		findParentLongest(MytierAddrTemp, parentofDest);
+		printf("\nParent : %s\n", parentofDest);
+		struct nodeHL* fNode1 = headHL;
+		if (fNode1 == NULL) {
+			if (enableLogScreen) {
+				printf("\nERROR: Neighbor List is empty \n");
+			}
+		}
+		while (fNode1 != NULL) {
+			//while (fNode->next != NULL) {
+			if ((strlen(fNode1->tier) == strlen(parentofDest)) && ((strncmp(fNode1->tier, parentofDest, strlen(parentofDest)) == 0))) {
+				strcpy(eth_addr1, fNode1->port);
+				printf("\nForwarding resolve response to : %s on %s", fNode1->tier, eth_addr1);
+				endNetworkSend(eth_addr1, headWithPayload, packetSize);
+				break; //return ()()
+			}
+			fNode1 = fNode1->next;
+		}
+		free(headWithPayload);
+		freeInterfaces();
+		interfaceListSize = 0;
+	}
+}
+
+/************************************************************************************
+ * 
+ * 
+ **************************************************************************************/
+
+void msg_typ_labl_lst(char buffer[2048], unsigned char* ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+    printf("\nReceived MESSAGE_TYPE_LABELS_LOST on : %s at CURRENT_TIME:%lf \n", recvOnEtherPort, getCurrentTime());
+
+    uint8_t totalEntries = ethhead[15];
+    int index = 16;
+    printf("totalEntries = %d\n", totalEntries);
+
+    char labels[totalEntries][128];
+    char *newLabels[totalEntries];
+    memset(newLabels, 0, sizeof(newLabels));
+    int newLabelCount = 0;
+
+    for (int i = 0; i < totalEntries; i++) {
+        uint8_t labelLength = ethhead[index++];
+        memcpy(labels[i], &ethhead[index], labelLength);
+        labels[i][labelLength] = '\0';
+        index += labelLength;
+        printf("Label %d: %s\n", i + 1, labels[i]);
+
+        if (!is_label_processed(labels[i])) {
+            newLabels[newLabelCount++] = labels[i];
+            add_processed_label(labels[i]);
+        }
+    }
+
+    if (newLabelCount == 0) {
+        printf("\nAll labels already processed, ignoring.\n");
+        return;
+    }
+
+    // Step 1: Delete received labels from IP-to-label map (tablehead / entries_LL).
+    // Pass myTier=3 to suppress the internal publishIPLabelMap_updated call inside
+    // delete_entry_LL_Addr_updated — we forward ALL received labels below, not just
+    // the subset that happened to exist in the IP-to-label map.
+    modify_LL_updated(labels, totalEntries, recvOnEtherPort, 3);
+
+    // Step 2: Delete received labels from neighbor table (headHL)
+    delete_neighbour(newLabels, newLabelCount, recvOnEtherPort);
+
+    printNeighbourTable(true);
+    print_entries_LL();
+
+    // Step 3: Forward MESSAGE_TYPE_PUBLISH_IP_DELETE with ALL labels from LABELS_LOST,
+    // regardless of which tables they were found in.
+    publishIPLabelMap_updated(newLabels, newLabelCount, 1, recvOnEtherPort, false);
+}
+
+bool collect_neighbours_by_failedPort(char failedPort[5], char ***collectedLabels, int *labelCount) {
+    struct nodeHL* current = headHL;
+    bool found = false;
+
+    char modifiedPort[10];  
+    snprintf(modifiedPort, sizeof(modifiedPort), "eth%s", failedPort);
+
+    printf("\nCollecting neighbors connected to port: %s\n", modifiedPort);
+
+    // Dynamically allocate an array to store collected labels
+    *collectedLabels = malloc(sizeof(char*) * 10);  // Initial size (adjust as needed)
+    *labelCount = 0;
+
+    while (current != NULL) {
+        if (strcmp(current->port, modifiedPort) == 0) {
+            printf("  Found neighbor: %s\n", current->tier);
+            found = true;
+
+            // Store the tier in the array
+            (*collectedLabels)[*labelCount] = strdup(current->tier);
+            (*labelCount)++;
+
+            // Optionally resize array if needed (for cases with many matches)
+            if (*labelCount >= 10) {  // Resize if more than 10 labels
+                *collectedLabels = realloc(*collectedLabels, sizeof(char*) * (*labelCount + 10));
+            }
+        }
+        current = current->next;
+    }
+
+    if (!found) {
+        printf("No neighbors found for port: %s\n", modifiedPort);
+    }
+
+    return found;
+}
+
+
+void msg_typ_ip_delt(char buffer[2048], unsigned char *ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr) {
+    //gettimeofday(&down_time, NULL);
+    //d_time = ((double)down_time.tv_sec * 1000000 + (double)down_time.tv_usec) / 1000000;
+    printf("\nReceived MESSAGE_TYPE_PUBLISH_IP_DELETE on : %s at CURRENT_TIME:%lf\n", recvOnEtherPort, getCurrentTime());
+
+    int index = 15; // Start parsing after Ethernet header
+
+    unsigned char totalEntries = ethhead[index];
+    index += 1;
+    printf("\nTotal Entries: %d\n", totalEntries);
+
+    if (totalEntries == 0) {
+        printf("No entries to process.\n");
+        return;
+    }
+
+    // Allocate memory for labels
+    char *labels[totalEntries];
+    char *newLabels[totalEntries]; // To store only new labels
+	
+    memset(labels, 0, sizeof(labels));
+    memset(newLabels, 0, sizeof(newLabels));
+
+    int newLabelCount = 0;
+
+    // Extract each labelReceived MESSAGE_TYPE_PUBLISH_IP_DELETE on :
+    for (int i = 0; i < totalEntries; i++) {
+        unsigned char labelLength = ethhead[index];
+        index += 1;
+
+        labels[i] = malloc(labelLength + 1);
+        memset(labels[i], '\0', labelLength + 1);
+        memcpy(labels[i], &ethhead[index], labelLength);
+        index += labelLength;
+
+        printf("\nEntry %d - Label: %s\n", i + 1, labels[i]);
+
+        // Check if label is already processed
+        if (!is_label_processed(labels[i])) {
+			printf("adding to processed label\n");
+            newLabels[newLabelCount] = labels[i]; // Add to new labels list
+            newLabelCount++;
+            add_processed_label(labels[i]); // Mark label as processed
+        } else {
+            free(labels[i]); // Free memory for already processed labels
+        }
+    }
+
+    // Process new labels only
+    if (newLabelCount == 0) {
+        printf("All labels are already processed.\n");
+    } else {
+		bool isRemoved = false;
+		if (myTierValue == 3) {
+			char** deletedLabels;
+			int deletedCount;
+            if (delete_entry_LL_Addr_updated(newLabels, newLabelCount, recvOnEtherPort, myTierValue, &deletedLabels, &deletedCount)) {
+				printf("\nLabel to IP Table after removing the addresses of the unreachable node CURRENT_TIME:%lf",getCurrentTime());
+				add_failed_entry_LL_updated(newLabels, newLabelCount);
+                churn_flag = true;
+                print_entries_LL();
+            }
+			for(int i=0; i<deletedCount;i++)
+			{
+				deleteTierAddr(deletedLabels[i]);
+				struct nodeHL* current = headHL,*prev = NULL;
+				char myLabelCopy[50];
+				strcpy(myLabelCopy, deletedLabels[i]);
+				char *tokens[4];
+				int count = 0;
+				char *saveptr;
+        		char *recvLabelToken = strtok_r(myLabelCopy, ".", &saveptr);
+				
+        		while (recvLabelToken) {
+            		tokens[count++] = recvLabelToken;
+            		recvLabelToken = strtok_r(NULL, ".", &saveptr);
+        		}
+				static char myMiddleBuffer[50];  
+        		snprintf(myMiddleBuffer, sizeof(myMiddleBuffer), "%s.%s", tokens[1], tokens[2]);
+        		char *myMiddleSegment = myMiddleBuffer;
+				while(current!=NULL)
+				{
+					char neighborCopy[50];
+        			strcpy(neighborCopy, current->tier);
+					char *neighborTokens[4];  
+        			int neighborCount = 0;
+					char *saveptr2;
+        			char *neighborToken = strtok_r(neighborCopy, ".", &saveptr2);
+					while (neighborToken) {
+            			neighborTokens[neighborCount++] = neighborToken;
+            			neighborToken = strtok_r(NULL, ".", &saveptr2);
+        			}
+					static char neighborLastBuffer[50];  
+        			snprintf(neighborLastBuffer, sizeof(neighborLastBuffer), "%s.%s", neighborTokens[neighborCount - 2], neighborTokens[neighborCount - 1]);
+        			char *neighborLastSegment = neighborLastBuffer;
+					if (neighborLastSegment && myMiddleSegment && strcmp(neighborLastSegment, myMiddleSegment) == 0) {
+						printf("\nMy label %s is derived from %s label from Neighbour Table\n", deletedLabels[i], current->tier);
+            			printf("\nRemoving label %s from Neighbour Table\n", current->tier);
+						isRemoved = true;
+						if(prev == NULL)
+						{
+							headHL = current->next;
+							free(current);
+							current = headHL;
+						} else {
+							prev->next = current->next;
+							free(current);
+							current = prev->next;
+						}
+        			} else {
+						prev = current;
+						current = current->next;
+					}
+				}
+			}
+
+
+			for (int i = 0; i < deletedCount; i++) {
+        		free(deletedLabels[i]);
+    		}
+    		free(deletedLabels);
+
+			printf("\nMy Label Table :%lf",getCurrentTime());
+			printMyLabels();
+			print_entries_LL();
+			printNeighbourTable(isRemoved);
+			isRemoved = false;
+			//publishIPLabelMap_updated(newLabels, newLabelCount, 1, recvOnEtherPort, false);
+        }
+		// Tejas addition - Simplified tier 1 msg_typ_ip_delt handler (Fix 7)
+		// logic with single call to deleteLabelsAndCheckGrandparents().
+		// Problem solved: The old isDerivedLabel path called delete_neighbour_by_failedPort(port) which
+		// wiped ALL neighbors on a port — too aggressive. With Fix 8 (exact-match Step 1),
+		// deleteLabelsAndCheckGrandparents handles everything correctly:
+		//   - Tier 2 labels in message → exact match removes from neighbor table (headHL)
+		//   - Tier 3 labels in message → checkIfGrandParent removes from routing table (tablehead)
+		//   - A-node failure (tier 3 only) → neighbor table untouched
+		//   - D-node failure (tier 2 + tier 3) → neighbor table entry removed by exact match
+		else if (myTierValue == 1) {
+			int totalDeletedCount = 0;
+			char** allDeletedLabels = deleteLabelsAndCheckGrandparents(newLabels, newLabelCount, &totalDeletedCount);
+
+			// Build union: received labels + deleted grandchildren, deduplicating
+			// (allDeletedLabels may contain labels already present in newLabels)
+			int uniqueDeletedCount = 0;
+			if (allDeletedLabels) {
+				for (int i = 0; i < totalDeletedCount; i++) {
+					bool dup = false;
+					for (int j = 0; j < newLabelCount; j++) {
+						if (strcmp(allDeletedLabels[i], newLabels[j]) == 0) { dup = true; break; }
+					}
+					if (!dup) uniqueDeletedCount++;
+				}
+			}
+			int totalForwardCount = newLabelCount + uniqueDeletedCount;
+			char** forwardLabels = malloc(totalForwardCount * sizeof(char*));
+			for (int i = 0; i < newLabelCount; i++) {
+				forwardLabels[i] = newLabels[i];
+			}
+			int fIdx = newLabelCount;
+			if (allDeletedLabels && totalDeletedCount > 0) {
+				printf("Deleted %d labels\n", totalDeletedCount);
+				for (int i = 0; i < totalDeletedCount; i++) {
+					printf("  %s\n", allDeletedLabels[i]);
+					bool dup = false;
+					for (int j = 0; j < newLabelCount; j++) {
+						if (strcmp(allDeletedLabels[i], newLabels[j]) == 0) { dup = true; break; }
+					}
+					if (!dup) {
+						forwardLabels[fIdx++] = allDeletedLabels[i]; // unique grandchild, forward it
+					} else {
+						free(allDeletedLabels[i]); // already in newLabels, skip
+					}
+				}
+				free(allDeletedLabels);
+			}
+			// Always forward received labels + unique deleted grandchildren
+			publishIPLabelMap_updated(forwardLabels, totalForwardCount, 1, recvOnEtherPort, false);
+			// Free only the grandchildren strings (newLabels freed at function end)
+			for (int i = newLabelCount; i < totalForwardCount; i++) {
+				free(forwardLabels[i]);
+			}
+			free(forwardLabels);
+			// Tejas addition - always print tables after delete processing for analysis script
+			printf("\nMy Label Table :%lf",getCurrentTime());
+			printMyLabels();
+			print_entries_LL();
+			printNeighbourTable(false);
+			churn_flag = true;
+		}else {
+
+			bool hasMyLabel = false;
+			bool derivedLabelExists = false;
+
+			for (int i = 0; i < newLabelCount; i++) {
+				struct nodeTL *temp = headTL;
+				while (temp) {
+					if (strcmp(temp->tier, newLabels[i]) == 0) {
+						hasMyLabel = true;
+						break;
+					}
+					temp = temp->next;
+				}
+				if (hasMyLabel) break;
+			}
+
+			if (!hasMyLabel) {
+				for (int i = 0; i < newLabelCount; i++) {
+					int tier;
+					char *middleSegment, *port;
+
+					extractLabelSegments(newLabels[i], &tier, &middleSegment, &port);
+
+					if (tier == 3 && port) {
+						if (isDerivedLabel(middleSegment)) {
+							printf("Derived from my label, deleting neighbor via failed port: %s\n", port);
+							delete_neighbour_by_failedPort(port);
+							//printf("\nNeighbour Table after removing the addresses of the unreachable node CURRENT_TIME:%lf", getCurrentTime());
+							printNeighbourTable(true);
+							printMyLabels();
+							derivedLabelExists = true;
+							break;
+						}
+					}
+				}
+
+				// If no derived labels exist, proceed with normal deletion
+				if (!derivedLabelExists) {
+					printf("\nLabels are not derived from me, Proceeding to delete only the received labels if they exist in neighbour table!\n");
+					if (delete_neighbour(newLabels, newLabelCount, recvOnEtherPort)) {
+						//printf("\nNeighbour Table after removing the addresses of the unreachable node CURRENT_TIME:%lf", getCurrentTime());
+						printNeighbourTable(true);
+						printMyLabels();
+					}else{
+						printf("\nRecieved Labels do not exist in the Neighbour table\n");
+					}
+				}
+
+				// Publish updates
+				publishIPLabelMap_updated(newLabels, newLabelCount, 1, recvOnEtherPort, false);
+			} else {
+				printf("\nOne of the received labels belongs to me. Deleting relevant neighbors and label entries.\n");
+				char *failedAddrs[newLabelCount];
+				int failedCount = 0;
+				for (int i = 0; i < newLabelCount; i++) {
+					struct nodeTL *temp = headTL, *prev = NULL;
+					char *labelPort = NULL;
+
+					while (temp) {
+						if (strcmp(temp->tier, newLabels[i]) == 0) {
+							labelPort = temp->port;
+							if (prev) {
+								prev->next = temp->next;
+							} else {
+								headTL = temp->next;
+							}
+							free(temp);
+							break;
+						}
+						prev = temp;
+						temp = temp->next;
+					}
+
+					if (labelPort) {
+						printf("\nLabel '%s' matches my label. Deleting all neighbors from port: %s\n", newLabels[i], labelPort);
+						char *portNumber = labelPort + 3;
+
+						isRemoved = delete_neighbour_by_failedPort(portNumber);
+						printf("\nPerforming derived label extraction...\n");
+
+						// Tokenize the label
+						char myLabelCopy[20];
+						strcpy(myLabelCopy, newLabels[i]);
+						char *tokens[3];  // Since we know the label always has 3 parts
+						int count = 0;
+						char *saveptr;
+						char *token = strtok_r(myLabelCopy, ".", &saveptr);
+						while (token && count < 3) {
+							tokens[count++] = token;
+							token = strtok_r(NULL, ".", &saveptr);
+						}
+						if (count == 3) { // Ensure there are exactly 3 parts
+						// Construct the middle and port part as discussed earlier
+						char middleSegment[10];
+						snprintf(middleSegment, sizeof(middleSegment), "%s.%s", tokens[1], tokens[2]);
+						printf("\nmiddleSegment %s\n",middleSegment);
+						// Get the derived label from the neighbor table based on the middle segment
+						getDerivedLabelsFromNeighbourTable(middleSegment, failedAddrs, &failedCount);
+						printf("\nfailed count %d\n",failedCount);
+						if (failedCount > 0) {
+							bool deleted = delete_neighbour(failedAddrs, failedCount, recvOnEtherPort);
+							isRemoved = true;
+							printf("\n in failed count %d\n",failedCount);
+							//printf("\nNeighbour Table after removing the addresses of the unreachable node CURRENT_TIME:%lf", getCurrentTime());
+							// Free dynamically allocated memory
+							for (int i = 0; i < failedCount; i++) {
+								free(failedAddrs[i]);
+							}
+						} else {
+							printf("\nNo derived label found for middle segment: %s\n", middleSegment);
+						}
+						}
+					}
+				}
+				printNeighbourTable(isRemoved);
+				printMyLabels();
+				publishIPLabelMap_updated(newLabels, newLabelCount, 1, recvOnEtherPort, false);
+			}
+		}
+		printNeighbourTable(isRemoved);
+		printMyLabels();
+    }
+    // Free allocated memory for new labels
+    for (int i = 0; i < newLabelCount; i++) {
+        free(newLabels[i]);
+    }
+}
+
+
+
+bool delete_neighbour(char* failedAddrs[], int failedCount, char recvOnEtherPort[5]) {
+	bool hasDelete = false;
+	if (failedCount <= 0 || headHL == NULL) {
+        return false;
+    }
+	int found = 0;
+	for (int i = 0; i < failedCount; i++) {
+        struct nodeHL *current = headHL, *prev = NULL;
+        //int found = 0;
+    	while (current != NULL) {
+			//printf("\ncurrent label = %s failed label = %s\n",current->tier,failedAddrs[i]);
+            if (strcmp(current->tier, failedAddrs[i]) == 0) {
+                // Print the label before removing it
+            	printf("\nRemoving label %s from Neighbour Table\n", current->tier);
+                // Delete the current node
+				hasDelete = true;
+                add_neighbor_blacklist(failedAddrs[i]);
+                if (prev == NULL) { // Removing the head node
+                    headHL = current->next;
+                    free(current);
+                    current = headHL;
+                } else { // Removing a non-head node
+                    prev->next = current->next;
+                    free(current);
+                    current = prev->next;
+                }
+
+                found = 1; // Mark that the label was found and removed
+                break;      // Exit the loop as the node is removed
+            } else {
+                // Move to the next node
+                prev = current;
+                current = current->next;
+            }
+        }
+		
+        // If the label was not found in the list
+        
+    }
+	if (!found) {
+            printf("All Labels already Processed.\n");
+    }
+	return hasDelete;
+}
+
+void extractLabelSegments(char *label, int *tier, char **middleSegment, char **port) {
+    static char labelCopy[50];  // Static buffer to persist across function calls
+    strcpy(labelCopy, label);
+
+    char *tokens[4];  // Max of 4 segments
+    int count = 0;
+
+    char *saveptr;
+    char *token = strtok_r(labelCopy, ".", &saveptr);
+    while (token) {
+        tokens[count++] = token;
+        token = strtok_r(NULL, ".", &saveptr);
+    }
+
+    if (count < 3) {  // Must have at least "tier.middle.port"
+        *tier = -1;
+        *middleSegment = NULL;
+        *port = NULL;
+        return;
+    }
+
+    // Extract tier (first segment)
+    *tier = atoi(tokens[0]);
+
+    // Extract port (last segment)
+    *port = tokens[count - 1];
+
+    // Extract middle segment correctly
+    static char middleBuffer[50];  
+    middleBuffer[0] = '\0';  // Clear buffer
+
+    if (count == 3) {  // Case: "tier.middle.port"
+        strcpy(middleBuffer, tokens[1]);  // Just the middle part
+    } else if (count == 4) {  // Case: "tier.middle1.middle2.port"
+        snprintf(middleBuffer, sizeof(middleBuffer), "%s.%s", tokens[1], tokens[2]);
+    }
+
+    *middleSegment = middleBuffer;
+
+    // Debug: Print extracted segments
+    printf("Original Label: %s | Tier: %d | Middle Segment: %s | Port: %s\n",
+           label, *tier,
+           *middleSegment ? *middleSegment : "NULL",
+           *port ? *port : "NULL");
+}
+
+bool isDerivedLabel(char *middleSegment) {
+	struct nodeTL *temp = headTL;
+	
+    
+    while (temp) {
+        char myLabelCopy[50];
+        strcpy(myLabelCopy, temp->tier);
+
+        char *tokens[4];  // Max 4 segments
+        int count = 0;
+
+        // Tokenize the label
+        char *saveptr;
+        char *token = strtok_r(myLabelCopy, ".", &saveptr);
+        while (token) {
+            tokens[count++] = token;
+            token = strtok_r(NULL, ".", &saveptr);
+        }
+
+        // Extract myMiddleSegment (everything except first and last)
+        static char myMiddleBuffer[50];  
+        myMiddleBuffer[0] = '\0';  
+
+        // Handle the case where the label has 2 segments (e.g., "1.2")
+        if (count == 2) {  // "tier.middle"
+            strcpy(myMiddleBuffer, tokens[1]);  // Use only the second token (middle)
+        } 
+        else if (count == 3) {  // "tier.middle.port"
+            snprintf(myMiddleBuffer, sizeof(myMiddleBuffer), "%s.%s", tokens[1], tokens[2]);
+        } 
+        else if (count == 4) {  // "tier.middle1.middle2.port"
+            snprintf(myMiddleBuffer, sizeof(myMiddleBuffer), "%s.%s", tokens[1], tokens[2]);
+        }
+
+        char *myMiddleSegment = myMiddleBuffer;
+
+        // Debugging output
+        printf("Comparing -> Received Middle Segment: %s, My Middle Segment: %s\n",
+               middleSegment ? middleSegment : "NULL",
+               myMiddleSegment ? myMiddleSegment : "NULL");
+
+        if (middleSegment && myMiddleSegment && strcmp(middleSegment, myMiddleSegment) == 0) {
+            return true;
+        }
+        temp = temp->next;
+    }
+    return false;
+}
+void getDerivedLabelsFromNeighbourTable(char *middleSegment, char *failedAddrs[], int *failedCount) {
+	
+    if (!middleSegment) return;
+
+    struct nodeHL *hlTemp = headHL;
+	printf("\nin getDerivedLabelsFromNeighbourTable\n");
+    while (hlTemp) {
+        char labelCopy[50];
+        strcpy(labelCopy, hlTemp->tier);
+
+        char *tokens[4];  
+        int count = 0;
+
+        char *saveptr;
+        char *token = strtok_r(labelCopy, ".", &saveptr);
+        while (token) {
+            tokens[count++] = token;
+            token = strtok_r(NULL, ".", &saveptr);
+        }
+
+        if (count >= 3) {
+            char myMiddleBuffer[50];  
+            snprintf(myMiddleBuffer, sizeof(myMiddleBuffer), "%s.%s", tokens[1], tokens[2]);
+
+            if (strcmp(middleSegment, myMiddleBuffer) == 0) {
+				printf("\nadding failed addresses\n");
+                failedAddrs[(*failedCount)++] = strdup(hlTemp->tier);  // Store all matching labels
+            }
+        }
+        hlTemp = hlTemp->next;
+    }
+
+    // Print the failedAddrs array and failedCount for debugging purposes
+    printf("Failed Addresses (%d):\n", *failedCount);
+    for (int i = 0; i < *failedCount; i++) {
+        printf("  %s\n", failedAddrs[i]);
+    }
+}
+
+
+
+bool isDerivedFrom(char *receivedLabel) {
+    struct nodeTL *temp = headTL;
+    
+    while (temp) {
+
+		if (strlen(temp->tier) == strlen(receivedLabel)) {
+            temp = temp->next;
+            continue;
+        }
+
+        char myLabelCopy[50];
+        strcpy(myLabelCopy, temp->tier);
+
+        char *tokens[4];  // Max 4 segments
+        int count = 0;
+
+        // Tokenize my label
+        char *saveptr;
+        char *token = strtok_r(myLabelCopy, ".", &saveptr);
+        while (token) {
+            tokens[count++] = token;
+            token = strtok_r(NULL, ".", &saveptr);
+        }
+
+        // Ensure my label has at least 4 segments
+        if (count < 4) {
+            temp = temp->next;
+            continue;
+        }
+
+        // Extract middle two segments of my label
+        static char myMiddleBuffer[50];  
+        snprintf(myMiddleBuffer, sizeof(myMiddleBuffer), "%s.%s", tokens[1], tokens[2]);
+        char *myMiddleSegment = myMiddleBuffer;
+
+        // Tokenize received label
+        char receivedCopy[50];
+        strcpy(receivedCopy, receivedLabel);
+
+        char *receivedTokens[4];  
+        int receivedCount = 0;
+
+        char *saveptr2;
+        char *receivedToken = strtok_r(receivedCopy, ".", &saveptr2);
+        while (receivedToken) {
+            receivedTokens[receivedCount++] = receivedToken;
+            receivedToken = strtok_r(NULL, ".", &saveptr2);
+        }
+
+        // Ensure received label has at least 2 segments
+        if (receivedCount < 2) {
+            temp = temp->next;
+            continue;
+        }
+
+        // Extract last two segments of received label
+        static char receivedLastBuffer[50];  
+        snprintf(receivedLastBuffer, sizeof(receivedLastBuffer), "%s.%s", receivedTokens[receivedCount - 2], receivedTokens[receivedCount - 1]);
+        char *receivedLastSegment = receivedLastBuffer;
+
+        // Debugging output
+        printf("\nComparing -> Received Last Two: %s (%s), My Middle Two: %s (%s)\n",
+               receivedLastSegment ? receivedLastSegment : "NULL", receivedLastSegment ? receivedLabel : "NULL",
+               myMiddleSegment ? myMiddleSegment : "NULL", myMiddleSegment ? myLabelCopy : "NULL");
+
+        if (receivedLastSegment && myMiddleSegment && strcmp(receivedLastSegment, myMiddleSegment) == 0) {
+            return true;
+        }
+
+        temp = temp->next;
+    }
+
+    return false;
+}
+
+
+
+bool delete_neighbour_by_failedPort(char failedPort[5]) {
+    struct nodeHL* current = headHL;
+    struct nodeHL* prev = NULL;
+    bool found = false;
+
+	char modifiedPort[10];  
+	snprintf(modifiedPort, sizeof(modifiedPort), "eth%s", failedPort);
+
+    printf("\nDeleting neighbors connected to port: %s\n", modifiedPort);
+    while (current != NULL) {
+        if (strcmp(current->port, modifiedPort) == 0) {
+            printf("  Deleting neighbor: %s\n", current->tier);
+            found = true;
+
+            // Remove the current node
+            if (prev == NULL) {  // Deleting head node
+                headHL = current->next;
+                free(current);
+                current = headHL;
+            } else {  // Deleting non-head node
+                prev->next = current->next;
+                free(current);
+                current = prev->next;
+            }
+        } else {
+            prev = current;
+            current = current->next;
+        }
+    }
+
+    if (!found) {
+        printf("No neighbors found for port: %s\n", modifiedPort);
+    }
+    return found;
+}
+
+
+bool checkIfChild(char* label, char* neighbor)
+{
+    int l1, l2, l3, l4;
+    int n1, n2, n3;
+
+    // Parse label (expecting 4 segments)
+    if (sscanf(label, "%d.%d.%d.%d", &l1, &l2, &l3, &l4) != 4)
+        return false;
+
+    // Parse neighbor (expecting 3 segments)
+    if (sscanf(neighbor, "%d.%d.%d", &n1, &n2, &n3) != 3)
+        return false;
+
+    // Check if middle two segments of label
+    // match last two segments of neighbor
+
+    if (l2 == n2 && l3 == n3)
+        return true;
+
+    return false;
+}
+
+char** deleteLabelsAndCheckGrandparents(char** labels, int labelCount, int* totalDeletedCount) {
+	bool isRemoved = false;
+    if (labels == NULL || labelCount == 0 || headHL == NULL || tablehead == NULL) {
+        printf("\nIn deleteLabelsAndCheckGrandparents: No valid labels to process\n");
+        *totalDeletedCount = 0;
+        return NULL;
+    }
+
+    // Allocate initial space (dynamically resized if needed)
+    int allocatedSize = labelCount * 2; // Assume worst case (each label has a grandchild)
+    char** deletedLabels = malloc(allocatedSize * sizeof(char*));
+    if (deletedLabels == NULL) {
+        perror("Failed to allocate memory for deleted labels");
+        *totalDeletedCount = 0;
+        return NULL;
+    }
+
+    *totalDeletedCount = 0;
+
+    // Tejas addition - Fix 9: Compute prefix to identify labels assigned by THIS C-node
+    // Format: "2.<our_addr_suffix>." e.g., "2.1." for C1 (label 1.1), "2.2." for C2 (label 1.2)
+    // When a received delete message contains a label matching our prefix, it means
+    // our connection to that D-node is broken. ALL other labels on the same port must
+    // also be removed from our neighbor table and their grandchildren from routing table.
+    // Problem solved: When D1 loses connection to C1, C1 receives delete for 2.1.1 from peers.
+    // C1 must also remove 2.2.1 (D1's label from C2) from its neighbor table because
+    // C1 can no longer reach D1 at all. Peer C-nodes (C2) receiving the same message
+    // do NOT trigger port cleanup because 2.1.1 does not match C2's prefix "2.2.".
+    // Does NOT impact IF_TIMER_DOWN: by the time forwarded messages arrive back at C1,
+    // the outer delete() loop has already cleaned all entries on the failed port.
+    char* myTierAddress = getTierInfo();
+    char myPrefix[10];
+    snprintf(myPrefix, sizeof(myPrefix), "2.%s.", myTierAddress + 2);
+    char portsToClean[5][20];
+    int portsToCleanCount = 0;
+
+    // **Step 1: Process all labels in Neighbor Table**
+    // Tejas addition - Fix 8: Use exact match only (removed checkIfChild)
+    // Previously this also had: || checkIfChild(label, currentNeighbor->tier)
+    // which caused tier 3 labels (e.g., 3.3.3.4) to incorrectly remove tier 2 labels
+    // (e.g., 2.3.3) from neighbor table during A-node failures.
+    // Problem solved: A-node failure message has only tier 3 labels. With checkIfChild,
+    // C-nodes would infer tier 2 parent labels and remove them, incorrectly losing
+    // D-node neighbor entries for still-alive D-nodes. With exact match only, tier 3
+    // labels don't match any tier 2 neighbor entries, so neighbor table stays untouched.
+    // D-node failure message includes tier 2 labels explicitly (Fix 6), so exact match works.
+    struct nodeHL *currentNeighbor, *prevNeighbor;
+    for (int i = 0; i < labelCount; i++) {
+        char* label = labels[i];
+        currentNeighbor = headHL;
+        prevNeighbor = NULL;
+
+        while (currentNeighbor != NULL) {
+
+            if (strcmp(currentNeighbor->tier, label) == 0)
+            {
+                printf("\nRemoving neighbor: %s\n", currentNeighbor->tier);
+                isRemoved = true;
+
+                // Tejas addition - Fix 9: If this is OUR label for the D-node, save the port
+                // Our connection to this D-node is broken, all labels on this port are stale
+                if (strncmp(label, myPrefix, strlen(myPrefix)) == 0) {
+                    bool portAlreadySaved = false;
+                    for (int p = 0; p < portsToCleanCount; p++) {
+                        if (strcmp(portsToClean[p], currentNeighbor->port) == 0) {
+                            portAlreadySaved = true;
+                            break;
+                        }
+                    }
+                    if (!portAlreadySaved && portsToCleanCount < 5) {
+                        printf("Own label %s deleted, will clean all entries on port %s\n",
+                               label, currentNeighbor->port);
+                        strcpy(portsToClean[portsToCleanCount], currentNeighbor->port);
+                        portsToCleanCount++;
+                    }
+                }
+
+                // Store deleted label
+                deletedLabels[*totalDeletedCount] = strdup(currentNeighbor->tier);
+                if (deletedLabels[*totalDeletedCount] != NULL)
+                    (*totalDeletedCount)++;
+
+                add_neighbor_blacklist(currentNeighbor->tier);
+
+                // Remove from list
+                if (prevNeighbor == NULL)
+                    headHL = currentNeighbor->next;
+                else
+                    prevNeighbor->next = currentNeighbor->next;
+
+                struct nodeHL* temp = currentNeighbor;
+                currentNeighbor = currentNeighbor->next;
+                free(temp);
+
+                continue;  // continue checking rest of neighbors
+            }
+
+            prevNeighbor = currentNeighbor;
+            currentNeighbor = currentNeighbor->next;
+        }
+    }
+
+    // Tejas addition - Fix 9: Port-based cleanup for own labels
+    // Remove ALL remaining entries on ports where our own labels were deleted.
+    // These are D-node's other labels from other C-nodes (e.g., 2.2.1 from C2
+    // when 2.1.1 from C1 was deleted). NOT added to deletedLabels (not forwarded
+    // to peers) because the D-node is still alive through other C-nodes.
+    for (int p = 0; p < portsToCleanCount; p++) {
+        currentNeighbor = headHL;
+        prevNeighbor = NULL;
+        while (currentNeighbor != NULL) {
+            if (strcmp(currentNeighbor->port, portsToClean[p]) == 0) {
+                printf("Port cleanup: removing %s on port %s (local only)\n",
+                       currentNeighbor->tier, portsToClean[p]);
+                isRemoved = true;
+                add_neighbor_blacklist(currentNeighbor->tier);
+
+                if (prevNeighbor == NULL)
+                    headHL = currentNeighbor->next;
+                else
+                    prevNeighbor->next = currentNeighbor->next;
+
+                struct nodeHL* temp = currentNeighbor;
+                currentNeighbor = currentNeighbor->next;
+                free(temp);
+                continue;
+            }
+            prevNeighbor = currentNeighbor;
+            currentNeighbor = currentNeighbor->next;
+        }
+    }
+
+    printNeighbourTable(isRemoved);
+
+    // **Step 2: Process all labels in LL Table**
+    struct addr_tuple* currentLL, *prevLL;
+    for (int i = 0; i < labelCount; i++) {
+        char* label = labels[i];
+        currentLL = tablehead;
+        prevLL = NULL;
+
+        while (currentLL != NULL) {
+            if (strcmp(currentLL->tier_addr, label) == 0 || (strlen(label) != 7 && checkIfGrandParent(currentLL->tier_addr, label))) {
+                printf("\nFound grandchild in Ip to Label Table, deleting: %s\n", currentLL->tier_addr);
+
+                // Resize array if needed
+                if (*totalDeletedCount >= allocatedSize) {
+                    allocatedSize *= 2;
+                    char** temp = realloc(deletedLabels, allocatedSize * sizeof(char*));
+                    if (temp == NULL) {
+                        perror("Failed to reallocate memory for deleted labels");
+                        break;
+                    }
+                    deletedLabels = temp;
+                }
+
+                // Store label
+                deletedLabels[*totalDeletedCount] = strdup(currentLL->tier_addr);
+                if (deletedLabels[*totalDeletedCount] == NULL) {
+                    perror("Failed to duplicate label");
+                } else {
+                    (*totalDeletedCount)++;
+                }
+
+                // Remove from LL Table
+                if (prevLL == NULL) {
+                    tablehead = currentLL->next;
+                } else {
+                    prevLL->next = currentLL->next;
+                }
+                free(currentLL);
+            }
+            prevLL = currentLL;
+            currentLL = currentLL->next;
+        }
+    }
+
+    // Grandchildren of port-cleaned labels are NOT removed from routing table —
+    // those routes are still reachable through other C-nodes.
+
+    print_entries_LL();
+
+    if (*totalDeletedCount == 0) {
+        free(deletedLabels);
+        return NULL;
+    }
+
+    return deletedLabels;
+}
+
+
+char** deleteLabelsForFailedInterface(char* failedInterface) {
+	printf("\ninside deleteLabelsForFailedInterface\n");
+    if (failedInterface == NULL || headHL == NULL || tablehead == NULL || headInterfaceLabel == NULL) {
+        return NULL;
+    }
+
+    // **Step 1: Find Child Labels for the Failed Interface**
+    struct childInterfaceToLabelList* currentInterfaceLabel = headInterfaceLabel;
+    while (currentInterfaceLabel != NULL) {
+        if (strcmp(currentInterfaceLabel->interface, failedInterface) == 0) {
+            break;
+        }
+        currentInterfaceLabel = currentInterfaceLabel->next;
+    }
+
+    if (currentInterfaceLabel == NULL || currentInterfaceLabel->labelList == NULL) {
+        printf("\nNo labels found for failed interface: %s\n", failedInterface);
+        return NULL;
+    }
+
+    // **Step 2: Count Child Labels for Memory Allocation**
+    int labelCount = 0;
+    struct labels* labelNode = currentInterfaceLabel->labelList;
+    while (labelNode != NULL) {
+        labelCount++;
+        labelNode = labelNode->next;
+    }
+
+    // Allocate memory for deleted labels
+    char** deletedLabels = malloc(labelCount * 2 * sizeof(char*)); // Double size for children + grandchildren
+    if (deletedLabels == NULL) {
+        perror("Failed to allocate memory for deleted labels");
+        return NULL;
+    }
+
+    int deletedIndex = 0;
+    labelNode = currentInterfaceLabel->labelList;
+
+    // **Step 3: Delete Child Labels from Neighbor Table**
+    while (labelNode != NULL) {
+        char* childLabel = labelNode->label;
+        struct nodeHL *currentNeighbor = headHL, *prevNeighbor = NULL;
+
+        while (currentNeighbor != NULL) {
+            if (strcmp(currentNeighbor->tier, childLabel) == 0) {
+                printf("\nRemoving child label from Neighbor Table: %s\n", childLabel);
+
+                deletedLabels[deletedIndex] = strdup(childLabel);
+                if (deletedLabels[deletedIndex] == NULL) {
+                    perror("Failed to duplicate label");
+                } else {
+                    deletedIndex++;
+                }
+
+                // Remove from Neighbor Table
+                if (prevNeighbor == NULL) {
+                    headHL = currentNeighbor->next;
+                } else {
+                    prevNeighbor->next = currentNeighbor->next;
+                }
+                free(currentNeighbor);
+                break;
+            }
+            prevNeighbor = currentNeighbor;
+            currentNeighbor = currentNeighbor->next;
+        }
+        labelNode = labelNode->next;
+    }
+
+    printNeighbourTable((deletedIndex>0) ? 1:0);
+
+    // **Step 4: Find and Delete Grandchildren from LL Table**
+    labelNode = currentInterfaceLabel->labelList;
+    while (labelNode != NULL) {
+        char* childLabel = labelNode->label;
+        struct addr_tuple* currentLL = tablehead;
+        struct addr_tuple* prevLL = NULL;
+
+        while (currentLL != NULL) {
+            if (strlen(childLabel) != 7 && checkIfGrandParent(currentLL->tier_addr, childLabel)) {
+                printf("\nFound grandchild in LL Table, deleting: %s\n", currentLL->tier_addr);
+
+                deletedLabels[deletedIndex] = strdup(currentLL->tier_addr);
+                if (deletedLabels[deletedIndex] == NULL) {
+                    perror("Failed to duplicate label");
+                } else {
+                    deletedIndex++;
+                }
+
+                // Remove from LL Table
+                if (prevLL == NULL) {
+                    tablehead = currentLL->next;
+                } else {
+                    prevLL->next = currentLL->next;
+                }
+                free(currentLL);
+            }
+            prevLL = currentLL;
+            currentLL = currentLL->next;
+        }
+        labelNode = labelNode->next;
+    }
+
+    print_entries_LL();
+
+    // If no labels were deleted, free allocated memory and return NULL
+	
+    if (deletedIndex == 0) {
+        	
+        for (int i = 0; i < labelCount; i++) {
+        	if (deletedLabels[i] != NULL) {
+            	free(deletedLabels[i]);
+            	deletedLabels[i] = NULL; // Set to NULL after freeing to avoid double free
+        }
+    
+
+        return NULL;
+    }
+	}
+    // Null terminate the list for easy processing
+    deletedLabels[deletedIndex] = NULL;
+	
+    return deletedLabels;
+}
+
+
+/*************************************************************************************
+ * 
+ *      
+**************************************************************************************/
+void msg_typ_ip_add(char buffer[2048], unsigned char *ethhead, char recvOnEtherPort[5], struct sockaddr_ll src_addr, int *n) {
+    printf("\nReceived MESSAGE_TYPE_PUBLISH_IP_ADD on : %s\n", recvOnEtherPort);
+
+    if (myTierValue == 3) {
+        printf("\nMESSAGE_TYPE_PUBLISH_IP_ADD received at destination\n");
+
+        int lengthIndex = 16;
+        int lengthOfTierAddrTemp = ethhead[lengthIndex];
+        unsigned char tierAddrTemp[lengthOfTierAddrTemp + 1];
+        memset(tierAddrTemp, '\0', sizeof(tierAddrTemp));
+        lengthIndex++;
+        memcpy(tierAddrTemp, &ethhead[lengthIndex], lengthOfTierAddrTemp);
+        lengthIndex += lengthOfTierAddrTemp;
+        printf("\nGot in response : %s", tierAddrTemp);
+
+        uint8_t ipLen = ethhead[lengthIndex];
+        struct in_addr ipAddr;
+        lengthIndex++;
+        memcpy(&ipAddr, &ethhead[lengthIndex], sizeof(struct in_addr));
+        lengthIndex += sizeof(struct in_addr);
+        uint8_t cidr = ethhead[lengthIndex];
+        lengthIndex++;
+
+        // Check if the label is already processed
+        if (is_label_processed((char *)tierAddrTemp)) {
+            printf("\nLabel %s already processed, removing from the list.\n", tierAddrTemp);
+            remove_processed_label((char *)tierAddrTemp);
+            return;
+        }
+
+        if (strcmp(ip_add, inet_ntoa(ipAddr)) == 0 || searchIPinMyMap(inet_ntoa(ipAddr)) == 0) {
+            return;
+        }
+
+        printf("\nipLen :%u IPAddr: %s cidr: %u\n", ipLen, inet_ntoa(ipAddr), cidr);
+
+        struct addr_tuple *a = (struct addr_tuple *)malloc(sizeof(struct addr_tuple));
+        memset(a, '\0', sizeof(struct addr_tuple));
+        strcpy(a->tier_addr, (char *)tierAddrTemp);
+
+        if (find_entry_LL(&ipAddr, (char *)tierAddrTemp) == NULL) {
+            a->if_index = src_addr.sll_ifindex;
+            a->isNew = true;
+            memcpy(&a->ip_addr, &ipAddr, sizeof(struct in_addr));
+            a->cidr = cidr;
+            churn_flag = true;
+            add_entry_LL(a);
+            print_entries_LL();
+        }
+    } else {
+        printf("\nMESSAGE_TYPE_PUBLISH_IP_ADD sent to my children to update\n");
+
+        unsigned char *headWithPayload;
+        int packetSize = *n - 14;
+        headWithPayload = (unsigned char *)malloc(packetSize);
+        memset(headWithPayload, '\0', packetSize);
+        memcpy(headWithPayload, &buffer[14], packetSize);
+
+        setInterfaces();
+        for (int loopCounter2 = 1; loopCounter2 < interfaceListSize; loopCounter2++) {
+            int port_number = matchPort(interfaceList[loopCounter2]);
+            if (port_number == 2) {
+                printf("\nSending MESSAGE_TYPE_PUBLISH_IP_ADD message to - %s\n", interfaceList[loopCounter2]);
+                endNetworkSend(interfaceList[loopCounter2], headWithPayload, packetSize);
+            }
+        }
+
+        free(headWithPayload);
+        freeInterfaces();
+        interfaceListSize = 0;
+    }
+}
