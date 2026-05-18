@@ -10,4 +10,4 @@ this sets up the mux sessions at every node and stores the screen prints in the 
 
 intf_down.sh
 uses nft for the traffic throttling. 
-records the time ?? what time (Peter) 
+records the time. 
